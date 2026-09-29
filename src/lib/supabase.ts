@@ -3,9 +3,16 @@ import { createClient } from '@supabase/supabase-js';
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL || '';
 const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY || '';
 
-console.log('=== 🔍 DEBUG SUPABASE 🔍 ===');
-console.log('URL:', supabaseUrl);
-console.log('LONGITUD DE LA CLAVE:', supabaseAnonKey ? supabaseAnonKey.length : 'NO SE ENCONTRÓ');
-console.log('============================');
+export const isSupabaseConfigured = Boolean(supabaseUrl && supabaseAnonKey);
 
-export const supabase = createClient(supabaseUrl, supabaseAnonKey);
+if (!isSupabaseConfigured) {
+  console.warn(
+    '[Supabase] Faltan VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY. ' +
+    'Define las variables de entorno para conectar la base de datos.'
+  );
+}
+
+export const supabase = createClient(
+  supabaseUrl || 'https://placeholder.supabase.co',
+  supabaseAnonKey || 'placeholder-anon-key',
+);

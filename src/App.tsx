@@ -6,79 +6,136 @@ import { ReportsContainer } from './components/reports/ReportsContainer';
 import { SettingsView } from './components/settings/SettingsView';
 import { AttendanceRecord, Employee, SystemConfig } from './types/attendance';
 import { SupabaseService } from './lib/supabaseService';
+import { isSupabaseConfigured } from './lib/supabase';
 import { migrateLocalStorageToSupabase } from "./lib/migrateLocalStorageToSupabase";
+import { StorageService, DEFAULT_CONFIG } from './utils/storage';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<'scanner' | 'employees' | 'reports' | 'settings'>('scanner');
-  
+
   // Persistent data states
   const [employees, setEmployees] = useState<Employee[]>([]);
   const [records, setRecords] = useState<AttendanceRecord[]>([]);
-  const [config, setConfig] = useState<SystemConfig>({} as SystemConfig);
+  const [config, setConfig] = useState<SystemConfig>(DEFAULT_CONFIG);
   const [isLoaded, setIsLoaded] = useState<boolean>(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
-  // Initialize from localStorage → migrate to Supabase first
+  // Initialize: migrate localStorage -> Supabase once, then load from Supabase
   useEffect(() => {
     (async () => {
-      await migrateLocalStorageToSupabase();
-      const loadedEmployees = await SupabaseService.getEmployees();
-      const loadedRecords = await SupabaseService.getRecords();
-      const loadedConfig = await SupabaseService.getConfig();
-      setEmployees(loadedEmployees || []);
-      setRecords(loadedRecords || []);
-      setConfig(loadedConfig);
-      setIsLoaded(true);
+      if (!isSupabaseConfigured) {
+        // Modo sin backend: usar datos locales para que la app sea utilizable en desarrollo
+        setEmployees(StorageService.getEmployees());
+        setRecords(StorageService.getRecords());
+        setConfig(StorageService.getConfig());
+        setLoadError('No hay conexión con Supabase (faltan VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY). Mostrando datos locales.');
+        setIsLoaded(true);
+        return;
+      }
+      try {
+        await migrateLocalStorageToSupabase();
+        const loadedEmployees = await SupabaseService.getEmployees();
+        const loadedRecords = await SupabaseService.getRecords();
+        const loadedConfig = await SupabaseService.getConfig();
+        setEmployees(loadedEmployees || []);
+        setRecords(loadedRecords || []);
+        setConfig(loadedConfig);
+      } catch (err: any) {
+        console.error('Error cargando datos de Supabase:', err);
+        setLoadError(`Error al conectar con Supabase: ${err?.message || err}. Verifica las credenciales y el schema (supabase/schema.sql).`);
+        setEmployees(StorageService.getEmployees());
+        setRecords(StorageService.getRecords());
+        setConfig(StorageService.getConfig());
+      } finally {
+        setIsLoaded(true);
+      }
     })();
   }, []);
 
   // Handlers for state & persistence
   const handleAddRecord = async (record: AttendanceRecord) => {
-    await SupabaseService.addRecord(record);
     setRecords(prev => [record, ...prev]);
+    StorageService.addRecord(record);
+    if (isSupabaseConfigured) {
+      try { await SupabaseService.addRecord(record); }
+      catch (err) { console.error('Error guardando registro:', err); }
+    }
   };
 
   const handleAddEmployee = async (emp: Employee) => {
-      const updated = [emp, ...employees];
-      setEmployees(updated);
-      await SupabaseService.saveEmployees(updated);
-    };
+    const updated = [emp, ...employees];
+    setEmployees(updated);
+    StorageService.saveEmployees(updated);
+    if (isSupabaseConfigured) {
+      try { await SupabaseService.saveEmployee(emp); }
+      catch (err) { console.error('Error guardando empleado:', err); }
+    }
+  };
 
   const handleUpdateEmployee = (emp: Employee) => {
     const updated = employees.map(e => e.id === emp.id ? emp : e);
     setEmployees(updated);
-    SupabaseService.saveEmployees(updated);
+    StorageService.saveEmployees(updated);
+    if (isSupabaseConfigured) {
+      SupabaseService.saveEmployee(emp).catch(err => console.error('Error actualizando empleado:', err));
+    }
   };
 
   const handleDeleteEmployee = (id: string) => {
     const updated = employees.filter(e => e.id !== id);
     setEmployees(updated);
-    SupabaseService.saveEmployees(updated);
+    StorageService.saveEmployees(updated);
+    if (isSupabaseConfigured) {
+      SupabaseService.deleteEmployee(id).catch(err => console.error('Error eliminando empleado:', err));
+    }
   };
 
   const handleUpdateConfig = (newConfig: SystemConfig) => {
     setConfig(newConfig);
-    SupabaseService.saveConfig(newConfig);
+    StorageService.saveConfig(newConfig);
+    if (isSupabaseConfigured) {
+      SupabaseService.saveConfig(newConfig).catch(err => console.error('Error guardando config:', err));
+    }
   };
 
   const handleToggleSound = () => {
     const newConfig = { ...config, soundEnabled: !config.soundEnabled };
     setConfig(newConfig);
-    SupabaseService.saveConfig(newConfig);
+    StorageService.saveConfig(newConfig);
+    if (isSupabaseConfigured) {
+      SupabaseService.saveConfig(newConfig).catch(err => console.error('Error guardando config:', err));
+    }
   };
 
   const handleResetData = async () => {
-    await SupabaseService.resetToDefault();
-    const resetEmps = await SupabaseService.getEmployees();
-    const resetRecs = await SupabaseService.getRecords();
-    const resetCfg = await SupabaseService.getConfig();
-    setEmployees(resetEmps || []);
-    setRecords(resetRecs || []);
-    setConfig(resetCfg || ({} as SystemConfig));
+    StorageService.resetToDefault();
+    if (isSupabaseConfigured) {
+      try {
+        await SupabaseService.clearRecords();
+        await SupabaseService.saveEmployees(StorageService.getEmployees());
+        await SupabaseService.saveConfig(StorageService.getConfig());
+        const resetEmps = await SupabaseService.getEmployees();
+        const resetRecs = await SupabaseService.getRecords();
+        const resetCfg = await SupabaseService.getConfig();
+        setEmployees(resetEmps || []);
+        setRecords(resetRecs || []);
+        setConfig(resetCfg || DEFAULT_CONFIG);
+        return;
+      } catch (err) {
+        console.error('Error al reiniciar datos en Supabase:', err);
+      }
+    }
+    setEmployees(StorageService.getEmployees());
+    setRecords([]);
+    setConfig(StorageService.getConfig());
   };
 
   const handleClearRecordsOnly = () => {
     setRecords([]);
-    SupabaseService.saveRecords([]);
+    StorageService.saveRecords([]);
+    if (isSupabaseConfigured) {
+      SupabaseService.clearRecords().catch(err => console.error('Error limpiando registros:', err));
+    }
   };
 
   const handleRestoreBackup = (
@@ -89,9 +146,16 @@ export default function App() {
     setEmployees(newEmployees);
     setRecords(newRecords);
     setConfig(newConfig);
-    SupabaseService.saveEmployees(newEmployees);
-    SupabaseService.saveRecords(newRecords);
-    SupabaseService.saveConfig(newConfig);
+    StorageService.saveEmployees(newEmployees);
+    StorageService.saveRecords(newRecords);
+    StorageService.saveConfig(newConfig);
+    if (isSupabaseConfigured) {
+      Promise.all([
+        SupabaseService.saveEmployees(newEmployees),
+        SupabaseService.saveRecords(newRecords),
+        SupabaseService.saveConfig(newConfig),
+      ]).catch(err => console.error('Error restaurando backup:', err));
+    }
   };
 
   if (!isLoaded) {
@@ -117,6 +181,18 @@ export default function App() {
         onToggleSound={handleToggleSound}
         activeEmployeesCount={activeEmployeesCount}
       />
+
+      {loadError && (
+        <div className="max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 pt-4">
+          <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm text-amber-300 flex items-start gap-2">
+            <span aria-hidden>⚠️</span>
+            <div>
+              <p>{loadError}</p>
+              <button onClick={() => setLoadError(null)} className="mt-1 text-xs underline text-amber-200">Cerrar</button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Main Content Area */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6">
