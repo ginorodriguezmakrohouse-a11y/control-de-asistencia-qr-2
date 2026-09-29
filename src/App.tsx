@@ -20,11 +20,28 @@ export default function App() {
   const [isLoaded, setIsLoaded] = useState<boolean>(false);
   const [loadError, setLoadError] = useState<string | null>(null);
 
-  // Initialize: migrate localStorage -> Supabase once, then load from Supabase
+  // Initialize: migrate localStorage -> Supabase once, then load from Supabase.
+  // IMPORTANTE: todo camino (éxito o error) debe terminar con setIsLoaded(true),
+  // si no la app queda en pantalla de carga infinita / blanca.
   useEffect(() => {
+    let cancelled = false;
+
+    const timeoutId = window.setTimeout(() => {
+      if (!cancelled && !isSupabaseConfigured) return; // modo local no necesita timeout
+      if (!cancelled) {
+        console.warn('Tiempo de espera agotado al conectar con Supabase, usando datos locales.');
+        setEmployees(StorageService.getEmployees());
+        setRecords(StorageService.getRecords());
+        setConfig(StorageService.getConfig());
+        setLoadError('No se pudo conectar con Supabase a tiempo (¿URL incorrecta, proyecto pausado o sin red?). Mostrando datos locales.');
+        setIsLoaded(true);
+      }
+    }, 15000);
+
     (async () => {
       if (!isSupabaseConfigured) {
         // Modo sin backend: usar datos locales para que la app sea utilizable en desarrollo
+        clearTimeout(timeoutId);
         setEmployees(StorageService.getEmployees());
         setRecords(StorageService.getRecords());
         setConfig(StorageService.getConfig());
@@ -37,19 +54,29 @@ export default function App() {
         const loadedEmployees = await SupabaseService.getEmployees();
         const loadedRecords = await SupabaseService.getRecords();
         const loadedConfig = await SupabaseService.getConfig();
-        setEmployees(loadedEmployees || []);
-        setRecords(loadedRecords || []);
-        setConfig(loadedConfig);
+        if (!cancelled) {
+          setEmployees(loadedEmployees || []);
+          setRecords(loadedRecords || []);
+          setConfig(loadedConfig);
+        }
       } catch (err: any) {
         console.error('Error cargando datos de Supabase:', err);
-        setLoadError(`Error al conectar con Supabase: ${err?.message || err}. Verifica las credenciales y el schema (supabase/schema.sql).`);
-        setEmployees(StorageService.getEmployees());
-        setRecords(StorageService.getRecords());
-        setConfig(StorageService.getConfig());
+        if (!cancelled) {
+          setLoadError(`Error al conectar con Supabase: ${err?.message || err}. Verifica las credenciales y el schema (supabase/schema.sql).`);
+          setEmployees(StorageService.getEmployees());
+          setRecords(StorageService.getRecords());
+          setConfig(StorageService.getConfig());
+        }
       } finally {
-        setIsLoaded(true);
+        clearTimeout(timeoutId);
+        if (!cancelled) setIsLoaded(true);
       }
     })();
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timeoutId);
+    };
   }, []);
 
   // Handlers for state & persistence
