@@ -27,15 +27,13 @@ export default function App() {
     let cancelled = false;
 
     const timeoutId = window.setTimeout(() => {
-      if (!cancelled && !isSupabaseConfigured) return; // modo local no necesita timeout
-      if (!cancelled) {
-        console.warn('Tiempo de espera agotado al conectar con Supabase, usando datos locales.');
-        setEmployees(StorageService.getEmployees());
-        setRecords(StorageService.getRecords());
-        setConfig(StorageService.getConfig());
-        setLoadError('No se pudo conectar con Supabase a tiempo (¿URL incorrecta, proyecto pausado o sin red?). Mostrando datos locales.');
-        setIsLoaded(true);
-      }
+      if (cancelled) return; // modo local / ya resuelto: no hacer nada
+      console.warn('Tiempo de espera agotado al conectar con Supabase, usando datos locales.');
+      setEmployees(StorageService.getEmployees());
+      setRecords(StorageService.getRecords());
+      setConfig(StorageService.getConfig());
+      setLoadError('No se pudo conectar con Supabase a tiempo (¿URL incorrecta, proyecto pausado o sin red?). Mostrando datos locales.');
+      setIsLoaded(true);
     }, 15000);
 
     (async () => {
