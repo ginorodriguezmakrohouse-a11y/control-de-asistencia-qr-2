@@ -1,0 +1,1143 @@
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { 
+  Camera, 
+  CameraOff, 
+  Sparkles, 
+  Clock, 
+  CheckCircle2, 
+  AlertTriangle, 
+  UserCheck, 
+  ArrowRight, 
+  Zap, 
+  Search, 
+  RefreshCw,
+  QrCode,
+  FileUp,
+  History,
+  XCircle,
+  HelpCircle,
+  SwitchCamera,
+  ShieldCheck,
+  CheckCircle,
+  Info
+} from 'lucide-react';
+import { Html5Qrcode, Html5QrcodeScannerState } from 'html5-qrcode';
+import confetti from 'canvas-confetti';
+import { 
+  AttendanceEventType, 
+  AttendanceRecord, 
+  Employee, 
+  SystemConfig 
+} from '../../types/attendance';
+import { 
+  checkIsLate, 
+  determineNextAttendanceEvent, 
+  EVENT_LABELS, 
+  formatFullTime, 
+  getCurrentTimeStr, 
+  getTodayDateStr 
+} from '../../utils/timeCalculations';
+import { sounds } from '../../utils/audio';
+
+interface QRScannerViewProps {
+  employees: Employee[];
+  records: AttendanceRecord[];
+  config: SystemConfig;
+  onAddRecord: (record: AttendanceRecord) => void;
+}
+
+export const QRScannerView: React.FC<QRScannerViewProps> = ({
+  employees,
+  records,
+  config,
+  onAddRecord,
+}) => {
+  // Scanner state
+  const [isScanning, setIsScanning] = useState<boolean>(false);
+  const [isStartingCamera, setIsStartingCamera] = useState<boolean>(false);
+  const [cameraError, setCameraError] = useState<{ title: string; message: string; type: 'permission' | 'notFound' | 'inUse' | 'generic' } | null>(null);
+  const [selectedCameraId, setSelectedCameraId] = useState<string>('');
+  const [facingMode, setFacingMode] = useState<'environment' | 'user'>('environment');
+  const [cameras, setCameras] = useState<Array<{ id: string; label: string }>>([]);
+  const [showDiagnostics, setShowDiagnostics] = useState<boolean>(false);
+  const [permissionStatus, setPermissionStatus] = useState<string>('desconocido');
+
+  const html5QrCodeRef = useRef<Html5Qrcode | null>(null);
+
+  // Manual or barcode input
+  const [manualCode, setManualCode] = useState<string>('');
+  const [selectedEventType, setSelectedEventType] = useState<AttendanceEventType | 'auto'>('auto');
+  
+  // Last scan feedback
+  const [lastScanResult, setLastScanResult] = useState<{
+    record: AttendanceRecord;
+    employee: Employee;
+    eventMeta: typeof EVENT_LABELS[keyof typeof EVENT_LABELS];
+    message: string;
+    isLate: boolean;
+    delayMinutes: number;
+  } | null>(null);
+
+  const [scanCooldown, setScanCooldown] = useState<boolean>(false);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [quickSearchTerm, setQuickSearchTerm] = useState<string>('');
+  const [showSimDrawer, setShowSimDrawer] = useState<boolean>(true);
+
+  // File upload scan ref
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  // Today's records for display
+  const todayDateStr = getTodayDateStr();
+  const todayRecords = records.filter(r => r.date === todayDateStr);
+
+  // Check browser permissions if supported
+  const checkPermissionState = useCallback(async () => {
+    try {
+      if (navigator.permissions && navigator.permissions.query) {
+        const status = await navigator.permissions.query({ name: 'camera' as PermissionName });
+        setPermissionStatus(status.state);
+        status.onchange = () => {
+          setPermissionStatus(status.state);
+        };
+      }
+    } catch {
+      setPermissionStatus('desconocido');
+    }
+  }, []);
+
+  // Fetch list of camera devices
+  const refreshCameras = useCallback(async () => {
+    try {
+      if (!navigator?.mediaDevices?.enumerateDevices) {
+        return;
+      }
+      const devices = await Html5Qrcode.getCameras();
+      if (devices && devices.length > 0) {
+        const mapped = devices.map((d, index) => ({
+          id: d.id,
+          label: d.label || `Cámara ${index + 1} (${d.id.slice(0, 8)})`,
+        }));
+        setCameras(mapped);
+        if (!selectedCameraId || !mapped.some(c => c.id === selectedCameraId)) {
+          setSelectedCameraId(mapped[0].id);
+        }
+      }
+    } catch {
+      // Permission might not yet be granted
+    }
+  }, [selectedCameraId]);
+
+  useEffect(() => {
+    checkPermissionState();
+    refreshCameras();
+  }, [checkPermissionState, refreshCameras]);
+
+  // Process a QR code or employee ID string
+  const handleProcessScan = useCallback((payload: string) => {
+    if (scanCooldown) return;
+    const cleanPayload = payload.trim();
+    if (!cleanPayload) return;
+
+    // Search employee by qrPayload, id, or documentId
+    const matchedEmployee = employees.find(
+      e => 
+        e.qrPayload.toLowerCase() === cleanPayload.toLowerCase() ||
+        e.id.toLowerCase() === cleanPayload.toLowerCase() ||
+        e.documentId.toLowerCase() === cleanPayload.toLowerCase() ||
+        cleanPayload.toLowerCase().includes(e.id.toLowerCase())
+    );
+
+    if (!matchedEmployee) {
+      if (config.soundEnabled) sounds.playError();
+      setErrorMessage(`Código QR "${cleanPayload}" no reconocido en el sistema.`);
+      setTimeout(() => setErrorMessage(null), 4000);
+      return;
+    }
+
+    if (!matchedEmployee.active) {
+      if (config.soundEnabled) sounds.playError();
+      setErrorMessage(`El empleado ${matchedEmployee.firstName} ${matchedEmployee.lastName} se encuentra DESACTIVADO.`);
+      setTimeout(() => setErrorMessage(null), 4000);
+      return;
+    }
+
+    // Determine event type
+    const empTodayRecords = todayRecords.filter(r => r.employeeId === matchedEmployee.id);
+    let eventTypeToRegister: AttendanceEventType;
+
+    if (selectedEventType === 'auto') {
+      const nextDecision = determineNextAttendanceEvent(matchedEmployee, empTodayRecords);
+      eventTypeToRegister = nextDecision.suggestedType;
+    } else {
+      eventTypeToRegister = selectedEventType;
+    }
+
+    const currentTime = getCurrentTimeStr();
+    const nowIso = new Date().toISOString();
+
+    // Check if late for morning entry
+    let isLate = false;
+    let delayMinutes = 0;
+    if (eventTypeToRegister === 'morning_in') {
+      const lateCheck = checkIsLate(
+        currentTime,
+        matchedEmployee.schedule.entryTime,
+        matchedEmployee.schedule.toleranceMinutes
+      );
+      isLate = lateCheck.isLate;
+      delayMinutes = lateCheck.delayMinutes;
+    }
+
+    const newRecord: AttendanceRecord = {
+      id: `REC-${Date.now()}-${matchedEmployee.id}`,
+      employeeId: matchedEmployee.id,
+      employeeName: `${matchedEmployee.firstName} ${matchedEmployee.lastName}`,
+      employeeDocument: matchedEmployee.documentId,
+      department: matchedEmployee.department,
+      avatarUrl: matchedEmployee.avatarUrl,
+      type: eventTypeToRegister,
+      timestamp: nowIso,
+      date: todayDateStr,
+      time: currentTime,
+      isLate,
+      delayMinutes,
+      terminalName: 'Terminal Principal RR.HH',
+    };
+
+    onAddRecord(newRecord);
+
+    // Audio & Visual feedback
+    if (config.soundEnabled) {
+      if (isLate) {
+        sounds.playWarning();
+      } else {
+        sounds.playSuccess();
+      }
+    }
+
+    // Small celebratory confetti for on-time morning entry
+    if (eventTypeToRegister === 'morning_in' && !isLate) {
+      try {
+        confetti({
+          particleCount: 25,
+          spread: 40,
+          origin: { y: 0.7 },
+        });
+      } catch {
+        // ignore
+      }
+    }
+
+    setLastScanResult({
+      record: newRecord,
+      employee: matchedEmployee,
+      eventMeta: EVENT_LABELS[eventTypeToRegister],
+      message: isLate 
+        ? `Tardanza registrada (+${delayMinutes} min sobre tolerancia)`
+        : '¡Marcación registrada correctamente!',
+      isLate,
+      delayMinutes,
+    });
+
+    setErrorMessage(null);
+    setManualCode('');
+
+    // Prevent immediate double scan (1.8s cooldown)
+    setScanCooldown(true);
+    setTimeout(() => {
+      setScanCooldown(false);
+    }, 1800);
+  }, [scanCooldown, employees, todayRecords, selectedEventType, config.soundEnabled, todayDateStr, onAddRecord]);
+
+  // Handle hardware USB barcode / QR scanner keystrokes
+  useEffect(() => {
+    let buffer = '';
+    let lastKeyTime = Date.now();
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Don't capture when typing in text inputs or textareas
+      const target = e.target as HTMLElement;
+      if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA') {
+        return;
+      }
+
+      const currentTime = Date.now();
+      if (currentTime - lastKeyTime > 300) {
+        buffer = '';
+      }
+      lastKeyTime = currentTime;
+
+      if (e.key === 'Enter') {
+        if (buffer.length >= 3) {
+          handleProcessScan(buffer);
+          buffer = '';
+        }
+      } else if (e.key.length === 1) {
+        buffer += e.key;
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [handleProcessScan]);
+
+  // Stop camera helper
+  const stopCamera = useCallback(async () => {
+    if (html5QrCodeRef.current) {
+      try {
+        const state = html5QrCodeRef.current.getState();
+        if (state === Html5QrcodeScannerState.SCANNING || state === Html5QrcodeScannerState.PAUSED) {
+          await html5QrCodeRef.current.stop();
+        }
+        await html5QrCodeRef.current.clear();
+      } catch (err) {
+        console.warn('Error clearing scanner:', err);
+      }
+      html5QrCodeRef.current = null;
+    }
+    setIsScanning(false);
+    setIsStartingCamera(false);
+  }, []);
+
+  // Robust camera starter with cascade fallback
+  const startCamera = async (targetFacingMode: 'environment' | 'user' = facingMode, targetCameraId?: string) => {
+    setCameraError(null);
+    setIsStartingCamera(true);
+
+    // 1. Verify browser supports mediaDevices
+    if (!navigator?.mediaDevices?.getUserMedia) {
+      setCameraError({
+        title: 'Cámara no soportada en este entorno',
+        message: 'Tu navegador o conexión actual no permite acceso directo a la cámara (se requiere conexión HTTPS o localhost). Puedes utilizar el ingreso manual, pistolas USB o subir la imagen del QR.',
+        type: 'generic',
+      });
+      setIsStartingCamera(false);
+      return;
+    }
+
+    try {
+      // Clean previous instance if active
+      if (html5QrCodeRef.current) {
+        await stopCamera();
+      }
+
+      const container = document.getElementById('qr-reader-container');
+      if (!container) {
+        throw new Error('Elemento contenedor del lector no encontrado');
+      }
+      // Ensure container is clean
+      container.innerHTML = '';
+
+      const qrScanner = new Html5Qrcode('qr-reader-container', { verbose: false });
+      html5QrCodeRef.current = qrScanner;
+
+      const scanConfig = {
+        fps: 15,
+        qrbox: (viewfinderWidth: number, viewfinderHeight: number) => {
+          const minEdge = Math.min(viewfinderWidth, viewfinderHeight);
+          const edgeSize = Math.max(160, Math.floor(minEdge * 0.72));
+          return { width: edgeSize, height: edgeSize };
+        },
+      };
+
+      const onScanSuccess = (decodedText: string) => {
+        handleProcessScan(decodedText);
+      };
+
+      const onScanError = () => {
+        // Frame-by-frame scanner errors are normal when no QR is in view
+      };
+
+      // Attempt 1: Target camera ID if explicitly provided or selected
+      const camIdToTry = targetCameraId || (selectedCameraId && selectedCameraId.length > 5 ? selectedCameraId : null);
+      let startedSuccessfully = false;
+
+      if (camIdToTry) {
+        try {
+          await qrScanner.start(camIdToTry, scanConfig, onScanSuccess, onScanError);
+          startedSuccessfully = true;
+        } catch (specificError) {
+          console.warn('Attempt with specific camera ID failed, falling back to facingMode:', specificError);
+        }
+      }
+
+      // Attempt 2: Facing mode (environment / rear)
+      if (!startedSuccessfully) {
+        try {
+          await qrScanner.start({ facingMode: targetFacingMode }, scanConfig, onScanSuccess, onScanError);
+          startedSuccessfully = true;
+        } catch (facingError) {
+          console.warn(`Attempt with ${targetFacingMode} failed, falling back:`, facingError);
+        }
+      }
+
+      // Attempt 3: Opposite facing mode (front / webcam)
+      if (!startedSuccessfully) {
+        const oppositeMode = targetFacingMode === 'environment' ? 'user' : 'environment';
+        try {
+          await qrScanner.start({ facingMode: oppositeMode }, scanConfig, onScanSuccess, onScanError);
+          setFacingMode(oppositeMode);
+          startedSuccessfully = true;
+        } catch (oppositeError) {
+          console.warn(`Attempt with ${oppositeMode} failed, falling back to any camera:`, oppositeError);
+        }
+      }
+
+      // Attempt 4: Direct fallback to default video device
+      if (!startedSuccessfully) {
+        // Request any camera stream directly
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+        // Release direct stream and start with facingMode 'user'
+        stream.getTracks().forEach(t => t.stop());
+        await qrScanner.start({ facingMode: 'user' }, scanConfig, onScanSuccess, onScanError);
+        startedSuccessfully = true;
+      }
+
+      setIsScanning(true);
+      setIsStartingCamera(false);
+      setPermissionStatus('granted');
+
+      // Refresh camera labels now that permission is granted
+      refreshCameras();
+    } catch (err: unknown) {
+      console.error('Camera startup error:', err);
+      setIsScanning(false);
+      setIsStartingCamera(false);
+
+      const errorStr = String(err);
+      if (errorStr.includes('NotAllowedError') || errorStr.includes('PermissionDeniedError') || errorStr.includes('denied')) {
+        setPermissionStatus('denied');
+        setCameraError({
+          title: 'Permiso de Cámara Denegado',
+          message: 'El navegador bloqueó el acceso a la cámara. Haz clic en el ícono del candado o cámara en la barra de direcciones de tu navegador, selecciona "Permitir" para la cámara y luego pulsa "Reintentar".',
+          type: 'permission',
+        });
+      } else if (errorStr.includes('NotFoundError') || errorStr.includes('DevicesNotFoundError')) {
+        setCameraError({
+          title: 'No se detectó ninguna cámara',
+          message: 'No encontramos ninguna cámara web conectada al dispositivo. Puedes usar la entrada manual, pistola USB o subir una imagen de QR.',
+          type: 'notFound',
+        });
+      } else if (errorStr.includes('NotReadableError') || errorStr.includes('TrackStartError') || errorStr.includes('could not start video source')) {
+        setCameraError({
+          title: 'Cámara en uso por otra aplicación',
+          message: 'La cámara parece estar ocupada por otra app (Zoom, Google Meet, Teams u otra pestaña del navegador). Cierra esas aplicaciones y pulsa "Reintentar".',
+          type: 'inUse',
+        });
+      } else {
+        setCameraError({
+          title: 'Error de Conexión de Cámara',
+          message: `No se pudo iniciar el lector: ${err instanceof Error ? err.message : errorStr}. Prueba con el botón "Cambiar Cámara" o revisa el diagnóstico.`,
+          type: 'generic',
+        });
+      }
+    }
+  };
+
+  // Flip camera between front (user) and back (environment)
+  const handleToggleFacingMode = async () => {
+    const newFacing = facingMode === 'environment' ? 'user' : 'environment';
+    setFacingMode(newFacing);
+    setSelectedCameraId('');
+    if (isScanning) {
+      await stopCamera();
+      startCamera(newFacing);
+    }
+  };
+
+  // Change specific camera from dropdown
+  const handleCameraChange = async (cameraId: string) => {
+    setSelectedCameraId(cameraId);
+    if (isScanning) {
+      await stopCamera();
+      startCamera(facingMode, cameraId);
+    }
+  };
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (html5QrCodeRef.current) {
+        try {
+          if (html5QrCodeRef.current.isScanning) {
+            html5QrCodeRef.current.stop();
+          }
+        } catch {
+          // ignore
+        }
+      }
+    };
+  }, []);
+
+  // File upload QR decoder using an off-screen isolated decoder
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    try {
+      // Use isolated off-screen element id
+      let fileDecoder = document.getElementById('qr-file-decoder');
+      if (!fileDecoder) {
+        fileDecoder = document.createElement('div');
+        fileDecoder.id = 'qr-file-decoder';
+        fileDecoder.style.display = 'none';
+        document.body.appendChild(fileDecoder);
+      }
+
+      const html5QrCode = new Html5Qrcode('qr-file-decoder');
+      const result = await html5QrCode.scanFile(file, true);
+      handleProcessScan(result);
+      await html5QrCode.clear();
+    } catch (err) {
+      console.warn('File decode error:', err);
+      setErrorMessage('No se encontró un código QR legible en la imagen seleccionada. Asegúrate de que esté bien iluminada y enfocada.');
+      setTimeout(() => setErrorMessage(null), 4000);
+    } finally {
+      if (fileInputRef.current) {
+        fileInputRef.current.value = '';
+      }
+    }
+  };
+
+  // Filter employees for quick simulation drawer
+  const filteredQuickEmployees = employees.filter(e => {
+    const term = quickSearchTerm.toLowerCase();
+    return (
+      e.firstName.toLowerCase().includes(term) ||
+      e.lastName.toLowerCase().includes(term) ||
+      e.documentId.toLowerCase().includes(term) ||
+      e.id.toLowerCase().includes(term) ||
+      e.department.toLowerCase().includes(term)
+    );
+  });
+
+  return (
+    <div className="space-y-6">
+      {/* Top Banner / Mode Controls */}
+      <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-6 shadow-xl">
+        <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
+          <div>
+            <h2 className="text-xl font-bold text-white flex items-center gap-2">
+              <span className="p-1.5 bg-emerald-500/20 text-emerald-400 rounded-lg">
+                <QrCode className="w-5 h-5" />
+              </span>
+              Puesto de Marcación RR.HH
+            </h2>
+            <p className="text-sm text-slate-400 mt-1">
+              Escanea el código QR del carnet del empleado, usa una pistola de código de barras USB o prueba con el simulador.
+            </p>
+          </div>
+
+          {/* Event Type Selector (Auto vs Manual) */}
+          <div className="flex flex-wrap items-center gap-2 bg-slate-950 p-1.5 rounded-xl border border-slate-800">
+            <span className="text-xs font-semibold text-slate-400 px-2 flex items-center gap-1">
+              <Zap className="w-3.5 h-3.5 text-amber-400" />
+              Tipo de Marcación:
+            </span>
+            <button
+              onClick={() => setSelectedEventType('auto')}
+              className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 ${
+                selectedEventType === 'auto'
+                  ? 'bg-emerald-500 text-slate-950 shadow-sm'
+                  : 'text-slate-400 hover:text-white hover:bg-slate-800'
+              }`}
+            >
+              <Sparkles className="w-3.5 h-3.5" />
+              <span>Auto Inteligente</span>
+            </button>
+            <button
+              onClick={() => setSelectedEventType('morning_in')}
+              className={`px-2.5 py-1.5 rounded-lg text-xs font-medium transition-all ${
+                selectedEventType === 'morning_in'
+                  ? 'bg-emerald-500 text-slate-950 font-bold'
+                  : 'text-slate-400 hover:text-white hover:bg-slate-800'
+              }`}
+            >
+              1. Entrada Mañana
+            </button>
+            <button
+              onClick={() => setSelectedEventType('lunch_out')}
+              className={`px-2.5 py-1.5 rounded-lg text-xs font-medium transition-all ${
+                selectedEventType === 'lunch_out'
+                  ? 'bg-amber-500 text-slate-950 font-bold'
+                  : 'text-slate-400 hover:text-white hover:bg-slate-800'
+              }`}
+            >
+              2. Salida Almuerzo
+            </button>
+            <button
+              onClick={() => setSelectedEventType('lunch_in')}
+              className={`px-2.5 py-1.5 rounded-lg text-xs font-medium transition-all ${
+                selectedEventType === 'lunch_in'
+                  ? 'bg-sky-500 text-slate-950 font-bold'
+                  : 'text-slate-400 hover:text-white hover:bg-slate-800'
+              }`}
+            >
+              3. Regreso Almuerzo
+            </button>
+            <button
+              onClick={() => setSelectedEventType('shift_out')}
+              className={`px-2.5 py-1.5 rounded-lg text-xs font-medium transition-all ${
+                selectedEventType === 'shift_out'
+                  ? 'bg-purple-500 text-slate-950 font-bold'
+                  : 'text-slate-400 hover:text-white hover:bg-slate-800'
+              }`}
+            >
+              4. Salida Fin
+            </button>
+          </div>
+        </div>
+
+        {/* Status indicator bar */}
+        <div className="mt-4 pt-3 border-t border-slate-800/80 flex flex-wrap items-center justify-between gap-3 text-xs text-slate-400">
+          <div className="flex items-center gap-3">
+            <span className="flex items-center gap-1.5">
+              <span className={`w-2.5 h-2.5 rounded-full ${
+                isScanning ? 'bg-emerald-400 animate-ping' : isStartingCamera ? 'bg-amber-400 animate-pulse' : 'bg-slate-600'
+              }`} />
+              {isScanning ? (
+                <span className="text-emerald-400 font-semibold">Cámara conectada ({facingMode === 'environment' ? 'Trasera' : 'Frontal'})</span>
+              ) : isStartingCamera ? (
+                <span className="text-amber-400 font-semibold">Conectando cámara...</span>
+              ) : (
+                'Cámara apagada'
+              )}
+            </span>
+            <span>•</span>
+            <span className="text-slate-300">
+              Pistola USB: <span className="text-emerald-400 font-mono font-medium">Lista (autodetección)</span>
+            </span>
+          </div>
+
+          <div className="flex items-center gap-3">
+            <button
+              onClick={() => setShowDiagnostics(!showDiagnostics)}
+              className="text-xs text-slate-400 hover:text-slate-200 flex items-center gap-1 font-medium transition-colors"
+            >
+              <Info className="w-3.5 h-3.5 text-cyan-400" />
+              <span>{showDiagnostics ? 'Ocultar Diagnóstico' : 'Diagnóstico de Cámara'}</span>
+            </button>
+            <span>•</span>
+            <button
+              onClick={() => setShowSimDrawer(!showSimDrawer)}
+              className="text-xs text-emerald-400 hover:text-emerald-300 flex items-center gap-1 font-semibold underline underline-offset-4"
+            >
+              {showSimDrawer ? 'Ocultar Simulador Rápido' : 'Mostrar Simulador Rápido'}
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* Camera Diagnostic Box if open */}
+      {showDiagnostics && (
+        <div className="bg-slate-900 border border-cyan-500/30 rounded-2xl p-5 shadow-xl animate-fade-in text-xs space-y-3">
+          <div className="flex items-center justify-between border-b border-slate-800 pb-2">
+            <h4 className="font-bold text-white flex items-center gap-2 text-sm">
+              <ShieldCheck className="w-4 h-4 text-cyan-400" />
+              Diagnóstico de Conexión de Cámara
+            </h4>
+            <button
+              onClick={() => {
+                checkPermissionState();
+                refreshCameras();
+              }}
+              className="px-2 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg flex items-center gap-1 font-mono text-[11px]"
+            >
+              <RefreshCw className="w-3 h-3 text-cyan-400" /> Refrescar Sensores
+            </button>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-1">
+            <div className="bg-slate-950 p-3 rounded-xl border border-slate-800">
+              <span className="text-slate-500 block text-[10px] uppercase font-bold">Protocolo Seguro</span>
+              <p className="font-mono font-bold text-emerald-400 mt-0.5 flex items-center gap-1">
+                <CheckCircle className="w-3.5 h-3.5" />
+                {window.isSecureContext ? 'HTTPS / Localhost (Válido)' : 'Inseguro (Requiere HTTPS)'}
+              </p>
+            </div>
+
+            <div className="bg-slate-950 p-3 rounded-xl border border-slate-800">
+              <span className="text-slate-500 block text-[10px] uppercase font-bold">Estado de Permisos</span>
+              <p className={`font-mono font-bold mt-0.5 capitalize flex items-center gap-1 ${
+                permissionStatus === 'granted' ? 'text-emerald-400' : permissionStatus === 'denied' ? 'text-rose-400' : 'text-amber-400'
+              }`}>
+                {permissionStatus === 'granted' && <CheckCircle className="w-3.5 h-3.5" />}
+                {permissionStatus === 'denied' && <XCircle className="w-3.5 h-3.5" />}
+                {permissionStatus === 'prompt' && <Clock className="w-3.5 h-3.5" />}
+                {permissionStatus === 'granted' ? 'Permiso Concedido' : permissionStatus === 'denied' ? 'Bloqueado por Usuario' : 'Pendiente de Aprobación'}
+              </p>
+            </div>
+
+            <div className="bg-slate-950 p-3 rounded-xl border border-slate-800">
+              <span className="text-slate-500 block text-[10px] uppercase font-bold">Cámaras Físicas Detectadas</span>
+              <p className="font-mono font-bold text-white mt-0.5">
+                {cameras.length} dispositivo(s)
+              </p>
+            </div>
+          </div>
+
+          <div className="p-3 bg-slate-950/70 border border-slate-800 rounded-xl space-y-1.5 text-slate-300 text-[11px]">
+            <p className="font-bold text-cyan-300">Guía rápida de resolución si la cámara no abre:</p>
+            <ul className="list-disc pl-4 space-y-1 text-slate-400">
+              <li><strong>Si dice Permiso Denegado:</strong> En Chrome/Edge/Safari, haz clic en el ícono de candado junto a la URL arriba a la izquierda y cambia Cámara a &quot;Permitir&quot;. Luego pulsa &quot;Activar Cámara&quot;.</li>
+              <li><strong>Si la pantalla queda en negro:</strong> Asegúrate de que ninguna otra app (Zoom, Teams, Meet) esté utilizando tu cámara web.</li>
+              <li><strong>Alternativas:</strong> Puedes usar el simulador de 1-click, ingresar el código de empleado manualmente o conectar cualquier lector de códigos de barras USB.</li>
+            </ul>
+          </div>
+        </div>
+      )}
+
+      {/* Main Grid: Scanner Left / Live Result Right */}
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+        
+        {/* Left Column: Live Camera & Manual Input (5 cols) */}
+        <div className="lg:col-span-5 space-y-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-xl">
+            
+            {/* Camera Header controls */}
+            <div className="flex items-center justify-between mb-3 gap-2">
+              <h3 className="text-sm font-bold text-white uppercase tracking-wider flex items-center gap-2">
+                <Camera className="w-4 h-4 text-emerald-400" />
+                Lector de Cámara QR
+              </h3>
+              
+              <div className="flex items-center gap-1.5">
+                {/* Flip camera front/back */}
+                <button
+                  onClick={handleToggleFacingMode}
+                  title={`Cambiar a cámara ${facingMode === 'environment' ? 'frontal' : 'trasera'}`}
+                  className="p-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-semibold flex items-center gap-1 transition-colors"
+                >
+                  <SwitchCamera className="w-3.5 h-3.5 text-emerald-400" />
+                  <span className="hidden sm:inline text-[10px]">{facingMode === 'environment' ? 'Trasera' : 'Frontal'}</span>
+                </button>
+
+                {/* Multiple camera dropdown if available */}
+                {cameras.length > 1 && (
+                  <select
+                    value={selectedCameraId}
+                    onChange={(e) => handleCameraChange(e.target.value)}
+                    className="text-xs bg-slate-950 text-slate-300 border border-slate-700 rounded-lg px-2 py-1 max-w-[130px] truncate"
+                  >
+                    {cameras.map(c => (
+                      <option key={c.id} value={c.id}>{c.label}</option>
+                    ))}
+                  </select>
+                )}
+              </div>
+            </div>
+
+            {/* Video Container (Explicit min-height prevents HTML5-QRCode 0px canvas crash) */}
+            <div className="relative bg-slate-950 rounded-xl overflow-hidden border border-slate-800 min-h-[300px] flex flex-col items-center justify-center">
+              
+              {/* HTML5-QRCode mount node */}
+              <div 
+                id="qr-reader-container" 
+                className="w-full min-h-[300px] [&_video]:w-full [&_video]:h-full [&_video]:min-h-[300px] [&_video]:object-cover" 
+              />
+
+              {/* Inactive State Screen */}
+              {!isScanning && (
+                <div className="absolute inset-0 flex flex-col items-center justify-center p-6 text-center bg-slate-950/95 backdrop-blur-xs">
+                  {isStartingCamera ? (
+                    <div className="flex flex-col items-center gap-3">
+                      <div className="w-12 h-12 border-3 border-emerald-400 border-t-transparent rounded-full animate-spin" />
+                      <p className="text-sm font-bold text-white">Iniciando cámara...</p>
+                      <p className="text-xs text-slate-400 max-w-xs">
+                        Solicitando permisos al navegador y conectando con el sensor de video.
+                      </p>
+                    </div>
+                  ) : (
+                    <>
+                      <div className="w-16 h-16 rounded-2xl bg-slate-800 border border-slate-700 flex items-center justify-center mb-3 text-slate-400">
+                        <CameraOff className="w-8 h-8 text-slate-400" />
+                      </div>
+                      <h4 className="text-base font-bold text-white">Cámara Lista para Conectar</h4>
+                      <p className="text-xs text-slate-400 max-w-xs mt-1 mb-4">
+                        Presiona el botón para encender la cámara y registrar la asistencia de los empleados escaneando su QR.
+                      </p>
+                      <div className="flex flex-wrap items-center justify-center gap-2">
+                        <button
+                          onClick={() => startCamera(facingMode)}
+                          className="px-5 py-2.5 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-sm rounded-xl shadow-lg shadow-emerald-500/25 flex items-center gap-2 transition-all active:scale-95"
+                        >
+                          <Camera className="w-4 h-4" />
+                          Activar Cámara
+                        </button>
+                        <button
+                          onClick={handleToggleFacingMode}
+                          className="px-3 py-2.5 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 font-semibold text-xs rounded-xl flex items-center gap-1.5 transition-all"
+                        >
+                          <SwitchCamera className="w-3.5 h-3.5 text-emerald-400" />
+                          <span>Modo: {facingMode === 'environment' ? 'Trasera' : 'Frontal'}</span>
+                        </button>
+                      </div>
+                    </>
+                  )}
+                </div>
+              )}
+
+              {/* Scanning Reticle Overlay */}
+              {isScanning && (
+                <div className="absolute inset-0 pointer-events-none flex items-center justify-center">
+                  <div className="w-56 h-56 border-2 border-emerald-400/80 rounded-2xl relative shadow-[0_0_25px_rgba(16,185,129,0.35)]">
+                    <div className="absolute top-0 left-0 w-4 h-4 border-t-4 border-l-4 border-emerald-400 -mt-1 -ml-1" />
+                    <div className="absolute top-0 right-0 w-4 h-4 border-t-4 border-r-4 border-emerald-400 -mt-1 -mr-1" />
+                    <div className="absolute bottom-0 left-0 w-4 h-4 border-b-4 border-l-4 border-emerald-400 -mb-1 -ml-1" />
+                    <div className="absolute bottom-0 right-0 w-4 h-4 border-b-4 border-r-4 border-emerald-400 -mb-1 -mr-1" />
+                    <div className="w-full h-0.5 bg-gradient-to-r from-transparent via-emerald-400 to-transparent animate-bounce mt-24 opacity-80" />
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Camera action buttons */}
+            <div className="mt-3 flex items-center gap-2">
+              {isScanning ? (
+                <button
+                  onClick={stopCamera}
+                  className="flex-1 py-2 bg-slate-800 hover:bg-slate-700 text-rose-400 border border-slate-700 rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 transition-all"
+                >
+                  <CameraOff className="w-3.5 h-3.5" />
+                  Pausar Cámara
+                </button>
+              ) : (
+                <button
+                  onClick={() => startCamera(facingMode)}
+                  disabled={isStartingCamera}
+                  className="flex-1 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 transition-all"
+                >
+                  <Camera className="w-3.5 h-3.5" />
+                  {isStartingCamera ? 'Iniciando...' : 'Iniciar Cámara'}
+                </button>
+              )}
+
+              {/* Upload file fallback */}
+              <input
+                type="file"
+                ref={fileInputRef}
+                accept="image/*"
+                onChange={handleFileUpload}
+                className="hidden"
+              />
+              <button
+                onClick={() => fileInputRef.current?.click()}
+                title="Subir foto o captura de un código QR"
+                className="p-2 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-xl text-slate-300 text-xs font-medium flex items-center gap-1"
+              >
+                <FileUp className="w-4 h-4 text-emerald-400" />
+                <span>Subir QR</span>
+              </button>
+            </div>
+
+            {/* Error diagnosis banner if camera failed */}
+            {cameraError && (
+              <div className="mt-3 p-3.5 bg-rose-500/10 border border-rose-500/30 rounded-xl text-xs space-y-2">
+                <div className="flex items-start gap-2">
+                  <AlertTriangle className="w-4 h-4 shrink-0 text-rose-400 mt-0.5" />
+                  <div>
+                    <h5 className="font-bold text-rose-300">{cameraError.title}</h5>
+                    <p className="text-slate-300 text-[11px] mt-0.5 leading-relaxed">{cameraError.message}</p>
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-2 pt-1 border-t border-rose-500/20">
+                  <button
+                    onClick={() => startCamera(facingMode === 'environment' ? 'user' : 'environment')}
+                    className="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg text-[11px] font-semibold flex items-center gap-1"
+                  >
+                    <SwitchCamera className="w-3 h-3 text-cyan-400" /> Probar con otra cámara
+                  </button>
+                  <button
+                    onClick={() => startCamera(facingMode)}
+                    className="px-2.5 py-1 bg-rose-600 hover:bg-rose-500 text-white rounded-lg text-[11px] font-bold"
+                  >
+                    Reintentar Conexión
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Manual input / USB Gun input */}
+            <div className="mt-5 pt-4 border-t border-slate-800">
+              <label className="text-xs font-bold text-slate-400 block mb-1.5 uppercase tracking-wider">
+                Ingreso manual o lector de código de barras:
+              </label>
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  handleProcessScan(manualCode);
+                }}
+                className="flex items-center gap-2"
+              >
+                <div className="relative flex-1">
+                  <input
+                    type="text"
+                    value={manualCode}
+                    onChange={(e) => setManualCode(e.target.value)}
+                    placeholder="Ej. QR-EMP-1001 o DNI / Código..."
+                    className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-emerald-500 font-mono"
+                  />
+                  {manualCode && (
+                    <button
+                      type="button"
+                      onClick={() => setManualCode('')}
+                      className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-500 hover:text-slate-300"
+                    >
+                      <XCircle className="w-4 h-4" />
+                    </button>
+                  )}
+                </div>
+                <button
+                  type="submit"
+                  disabled={!manualCode.trim()}
+                  className="px-4 py-2 bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-slate-950 font-bold text-xs rounded-xl transition-all"
+                >
+                  Registrar
+                </button>
+              </form>
+              <p className="text-[11px] text-slate-500 mt-1 flex items-center gap-1">
+                <HelpCircle className="w-3 h-3 text-slate-600" />
+                Los lectores de código de barras USB ingresan el código automáticamente.
+              </p>
+            </div>
+          </div>
+        </div>
+
+        {/* Right Column: Hero Result & Recent Feed (7 cols) */}
+        <div className="lg:col-span-7 space-y-4">
+          
+          {/* Error Banner if any */}
+          {errorMessage && (
+            <div className="p-4 bg-rose-500/10 border-2 border-rose-500/40 rounded-2xl flex items-center gap-3 text-rose-300 animate-shake">
+              <XCircle className="w-6 h-6 text-rose-400 shrink-0" />
+              <div>
+                <p className="font-bold text-sm">Error en el Escaneo</p>
+                <p className="text-xs">{errorMessage}</p>
+              </div>
+            </div>
+          )}
+
+          {/* Last Scanned Employee Hero Card */}
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl relative overflow-hidden">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-800/80 mb-4">
+              <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider flex items-center gap-2">
+                <UserCheck className="w-4 h-4 text-emerald-400" />
+                Última Marcación Confirmada
+              </h3>
+              {lastScanResult && (
+                <span className="text-xs font-mono text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/30">
+                  {formatFullTime(lastScanResult.record.timestamp)}
+                </span>
+              )}
+            </div>
+
+            {lastScanResult ? (
+              <div className="flex flex-col sm:flex-row items-center sm:items-start gap-5">
+                {/* Employee Photo */}
+                <div className="relative shrink-0">
+                  <img
+                    src={lastScanResult.employee.avatarUrl}
+                    alt={lastScanResult.employee.firstName}
+                    className="w-24 h-24 sm:w-28 sm:h-28 rounded-2xl object-cover border-2 border-emerald-400 shadow-xl"
+                  />
+                  <div className="absolute -bottom-2 -right-2 w-7 h-7 rounded-full bg-emerald-500 flex items-center justify-center text-slate-950 font-bold shadow-md">
+                    <CheckCircle2 className="w-4 h-4 stroke-[3]" />
+                  </div>
+                </div>
+
+                {/* Details */}
+                <div className="flex-1 text-center sm:text-left space-y-2">
+                  <div>
+                    <div className="flex flex-wrap items-center justify-center sm:justify-start gap-2">
+                      <h4 className="text-xl font-extrabold text-white">
+                        {lastScanResult.employee.firstName} {lastScanResult.employee.lastName}
+                      </h4>
+                      <span className="px-2 py-0.5 text-xs font-mono bg-slate-800 text-slate-300 rounded border border-slate-700">
+                        {lastScanResult.employee.id}
+                      </span>
+                    </div>
+                    <p className="text-sm font-medium text-emerald-400 mt-0.5">
+                      {lastScanResult.employee.position} &bull; <span className="text-slate-400">{lastScanResult.employee.department}</span>
+                    </p>
+                    <p className="text-xs text-slate-400 font-mono mt-0.5">
+                      DNI / Doc: {lastScanResult.employee.documentId}
+                    </p>
+                  </div>
+
+                  {/* Registered Event Pill */}
+                  <div className="pt-2">
+                    <div className={`inline-flex items-center gap-2 px-3.5 py-1.5 rounded-xl border text-sm font-bold shadow-md ${lastScanResult.eventMeta.badgeBg}`}>
+                      <span className="w-2.5 h-2.5 rounded-full animate-ping" style={{ backgroundColor: lastScanResult.eventMeta.color }} />
+                      <span>{lastScanResult.eventMeta.label.toUpperCase()}</span>
+                      <span className="font-mono text-xs opacity-90">({lastScanResult.record.time})</span>
+                    </div>
+                  </div>
+
+                  {/* Punctuality Status Note */}
+                  {lastScanResult.record.type === 'morning_in' && (
+                    <div className="mt-2">
+                      {lastScanResult.isLate ? (
+                        <div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-amber-500/10 border border-amber-500/30 text-xs font-medium text-amber-300">
+                          <AlertTriangle className="w-3.5 h-3.5 text-amber-400" />
+                          <span>Tardanza: +{lastScanResult.delayMinutes} min (Horario oficial: {lastScanResult.employee.schedule.entryTime})</span>
+                        </div>
+                      ) : (
+                        <div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-xs font-medium text-emerald-300">
+                          <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
+                          <span>Puntual a tiempo (Tolerancia: {lastScanResult.employee.schedule.toleranceMinutes} min)</span>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  <div className="text-[11px] text-slate-500 flex items-center justify-center sm:justify-start gap-1 pt-1">
+                    <Clock className="w-3 h-3" />
+                    <span>Dispositivo: {lastScanResult.record.terminalName}</span>
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <div className="py-8 flex flex-col items-center justify-center text-center text-slate-500">
+                <div className="w-14 h-14 rounded-2xl bg-slate-950 border border-slate-800 flex items-center justify-center mb-3 text-slate-600">
+                  <QrCode className="w-7 h-7" />
+                </div>
+                <h4 className="text-sm font-semibold text-slate-400">Esperando primer escaneo</h4>
+                <p className="text-xs text-slate-500 max-w-sm mt-1">
+                  Pasa el código QR frente a la cámara o selecciona un empleado en el simulador rápido de abajo para registrar la asistencia.
+                </p>
+              </div>
+            )}
+          </div>
+
+          {/* Quick Simulation Drawer */}
+          {showSimDrawer && (
+            <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-xl">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-3">
+                <div className="flex items-center gap-2">
+                  <Sparkles className="w-4 h-4 text-amber-400" />
+                  <h4 className="text-sm font-bold text-white">Simulador Rápido de Marcaciones</h4>
+                  <span className="text-[10px] bg-slate-800 text-slate-400 px-2 py-0.5 rounded-full font-mono">
+                    1-Click Test
+                  </span>
+                </div>
+                
+                {/* Search in simulator */}
+                <div className="relative">
+                  <Search className="w-3.5 h-3.5 text-slate-500 absolute left-2.5 top-1/2 -translate-y-1/2" />
+                  <input
+                    type="text"
+                    value={quickSearchTerm}
+                    onChange={(e) => setQuickSearchTerm(e.target.value)}
+                    placeholder="Buscar empleado..."
+                    className="bg-slate-950 border border-slate-800 rounded-lg pl-8 pr-3 py-1 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-emerald-500 w-44"
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 max-h-60 overflow-y-auto pr-1">
+                {filteredQuickEmployees.map(emp => {
+                  const empToday = todayRecords.filter(r => r.employeeId === emp.id);
+                  const nextEvent = determineNextAttendanceEvent(emp, empToday);
+                  const nextMeta = EVENT_LABELS[nextEvent.suggestedType];
+
+                  return (
+                    <div
+                      key={emp.id}
+                      className="p-2.5 rounded-xl bg-slate-950 border border-slate-800 hover:border-slate-700 flex items-center justify-between gap-3 group transition-all"
+                    >
+                      <div className="flex items-center gap-2.5 min-w-0">
+                        <img
+                          src={emp.avatarUrl}
+                          alt={emp.firstName}
+                          className="w-9 h-9 rounded-lg object-cover border border-slate-700 shrink-0"
+                        />
+                        <div className="min-w-0">
+                          <p className="text-xs font-bold text-white truncate group-hover:text-emerald-400">
+                            {emp.firstName} {emp.lastName}
+                          </p>
+                          <p className="text-[10px] text-slate-400 truncate">
+                            {emp.position} &bull; {emp.department}
+                          </p>
+                        </div>
+                      </div>
+
+                      <button
+                        onClick={() => handleProcessScan(emp.qrPayload)}
+                        title={`Marcar: ${nextMeta.label}`}
+                        className="shrink-0 px-2.5 py-1.5 rounded-lg text-[11px] font-bold transition-all flex items-center gap-1 shadow-sm active:scale-95 text-white"
+                        style={{ backgroundColor: nextMeta.color }}
+                      >
+                        <span>{nextMeta.short}</span>
+                        <ArrowRight className="w-3 h-3" />
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Today's Recent Scans Stream */}
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-xl">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-800 mb-3">
+              <h4 className="text-xs font-bold text-slate-400 uppercase tracking-wider flex items-center gap-2">
+                <History className="w-4 h-4 text-emerald-400" />
+                Marcaciones de Hoy ({todayRecords.length})
+              </h4>
+              <span className="text-xs text-slate-500">
+                Orden cronológico inverso
+              </span>
+            </div>
+
+            {todayRecords.length === 0 ? (
+              <p className="text-xs text-slate-500 py-4 text-center">
+                Aún no hay marcaciones registradas para el día de hoy.
+              </p>
+            ) : (
+              <div className="space-y-2 max-h-56 overflow-y-auto pr-1">
+                {todayRecords.slice(0, 10).map((rec) => {
+                  const meta = EVENT_LABELS[rec.type] || EVENT_LABELS.morning_in;
+                  return (
+                    <div
+                      key={rec.id}
+                      className="p-2.5 rounded-xl bg-slate-950 border border-slate-800/80 flex items-center justify-between gap-3 text-xs"
+                    >
+                      <div className="flex items-center gap-2.5">
+                        <img
+                          src={rec.avatarUrl}
+                          alt={rec.employeeName}
+                          className="w-7 h-7 rounded-full object-cover border border-slate-700"
+                        />
+                        <div>
+                          <p className="font-bold text-white">{rec.employeeName}</p>
+                          <p className="text-[10px] text-slate-400">{rec.department}</p>
+                        </div>
+                      </div>
+
+                      <div className="flex items-center gap-2">
+                        {rec.isLate && (
+                          <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-rose-500/20 text-rose-300 border border-rose-500/30">
+                            Tardanza +{rec.delayMinutes}m
+                          </span>
+                        )}
+                        <span className={`px-2 py-0.5 rounded-md text-[11px] font-bold border ${meta.badgeBg}`}>
+                          {meta.short}
+                        </span>
+                        <span className="font-mono text-slate-400 font-medium">
+                          {rec.time}
+                        </span>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+        </div>
+
+      </div>
+    </div>
+  );
+};
