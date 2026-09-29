@@ -3,9 +3,26 @@ import { createClient } from '@supabase/supabase-js';
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL || '';
 const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY || '';
 
-console.log('=== 🔍 DEBUG SUPABASE 🔍 ===');
-console.log('URL:', supabaseUrl);
-console.log('LONGITUD DE LA CLAVE:', supabaseAnonKey ? supabaseAnonKey.length : 'NO SE ENCONTRÓ');
-console.log('============================');
+// Solo considerar configuradas credenciales reales (no placeholders ni valores de ejemplo).
+const looksLikePlaceholder =
+  !supabaseUrl ||
+  supabaseUrl.includes('placeholder') ||
+  supabaseUrl.includes('YOUR_PROJECT') ||
+  !/^https?:\/\//.test(supabaseUrl) ||
+  !supabaseAnonKey ||
+  supabaseAnonKey.includes('placeholder') ||
+  supabaseAnonKey === 'your-anon-key';
 
-export const supabase = createClient(supabaseUrl, supabaseAnonKey);
+export const isSupabaseConfigured = !looksLikePlaceholder;
+
+if (!isSupabaseConfigured) {
+  console.warn(
+    '[Supabase] Faltan (o son de ejemplo) VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY. ' +
+    'La app funcionará en modo local (localStorage).'
+  );
+}
+
+export const supabase = createClient(
+  isSupabaseConfigured ? supabaseUrl : 'https://placeholder.supabase.co',
+  isSupabaseConfigured ? supabaseAnonKey : 'placeholder-anon-key',
+);

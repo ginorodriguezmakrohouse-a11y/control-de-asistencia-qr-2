@@ -46,7 +46,8 @@ export const QRGenerator: React.FC<QRGeneratorProps> = ({ employees, onGenerateQ
       
       return { employeeId: employee.id, publicUrl: publicUrl as string };
     } catch (error) {
-      throw new Error(`Error para ${employee.firstName}: ${error.message}`);
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`Error para ${employee.firstName}: ${message}`);
     }
   };
 
@@ -131,7 +132,7 @@ export const QRGenerator: React.FC<QRGeneratorProps> = ({ employees, onGenerateQ
                     src={result.publicUrl} 
                     alt={`QR ${employee?.firstName || 'Employee'}`} 
                     className="w-24 h-24 mx-auto mb-2 rounded bg-white"
-                    onError={(e) => { e.target.src = '/placeholder.svg'; }}
+                    onError={(e) => { (e.target as HTMLImageElement).src = '/placeholder.svg'; }}
                   />
                   <p className="font-medium text-slate-700">{employee?.firstName || 'Employee'}</p>
                   <p className="text-xs text-slate-500 break-all">{result.publicUrl}</p>
