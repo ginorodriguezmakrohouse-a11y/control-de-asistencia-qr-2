@@ -15,11 +15,13 @@ async function getConfigFallback(): Promise<SystemConfig> {
 }
 
 export const SupabaseService = {
+  // Devuelve TODOS los empleados (incluidos inactivos): la UI de gestión
+  // necesita verlos y el escáner debe poder avisar "DESACTIVADO" en vez de
+  // "código no reconocido".
   async getEmployees(): Promise<Employee[]> {
     const { data, error } = await supabase
       .from('employees')
       .select('*')
-      .eq('active', true)
       .order('last_name');
     if (error) throw error;
     return (data || []).map(employeeFromDb);

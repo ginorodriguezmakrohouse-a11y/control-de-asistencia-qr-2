@@ -138,13 +138,21 @@ export const QRScannerView: React.FC<QRScannerViewProps> = ({
     const cleanPayload = payload.trim();
     if (!cleanPayload) return;
 
-    // Search employee by qrPayload, id, or documentId
+    // Search employee by qrPayload, id, or documentId (solo coincidencia exacta:
+    // el "includes" laxo podía hacer match con el empleado equivocado).
+    const lp = cleanPayload.toLowerCase();
+    const codeMatch = lp.match(/(?:code|qr|id)=([^&\s]+)/);
     const matchedEmployee = employees.find(
       e => 
-        e.qrPayload.toLowerCase() === cleanPayload.toLowerCase() ||
-        e.id.toLowerCase() === cleanPayload.toLowerCase() ||
-        e.documentId.toLowerCase() === cleanPayload.toLowerCase() ||
-        cleanPayload.toLowerCase().includes(e.id.toLowerCase())
+        e.qrPayload.toLowerCase() === lp ||
+        e.id.toLowerCase() === lp ||
+        e.documentId.toLowerCase() === lp ||
+        // tolerar QR que envuelve el payload, p.ej. "https://...?code=QR-EMP-1001"
+        (!!codeMatch && (
+          codeMatch[1] === e.qrPayload.toLowerCase() ||
+          codeMatch[1] === e.id.toLowerCase() ||
+          codeMatch[1] === e.documentId.toLowerCase()
+        ))
     );
 
     if (!matchedEmployee) {
@@ -189,7 +197,11 @@ export const QRScannerView: React.FC<QRScannerViewProps> = ({
     }
 
     const newRecord: AttendanceRecord = {
-      id: `REC-${Date.now()}-${matchedEmployee.id}`,
+      // randomUUID evita colisiones de PRIMARY KEY al marcar dos terminales
+      // el mismo milisegundo (Date.now() era predecible/duplicable).
+      id: (typeof crypto !== 'undefined' && 'randomUUID' in crypto)
+        ? `REC-${crypto.randomUUID()}`
+        : `REC-${Date.now()}-${Math.random().toString(36).slice(2, 10)}-${matchedEmployee.id}`,
       employeeId: matchedEmployee.id,
       employeeName: `${matchedEmployee.firstName} ${matchedEmployee.lastName}`,
       employeeDocument: matchedEmployee.documentId,
