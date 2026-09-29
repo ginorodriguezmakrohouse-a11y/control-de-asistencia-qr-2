@@ -1,0 +1,16 @@
+# Netlify configuration for LIMONADA (Vite + React)
+# Deploy: Netlify via Git or drag-and-drop
+
+[build]
+  command = "npm run build"
+  publish = "dist"
+
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
+
+[env]
+# Supabase (set in Netlify UI → Site settings → Environment variables)
+# NEXT_PUBLIC_SUPABASE_URL = "your-url"
+# NEXT_PUBLIC_SUPABASE_ANON_KEY = "your-key"
