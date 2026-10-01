@@ -12,6 +12,7 @@ import {
   TrendingUp
 } from 'lucide-react';
 import { AttendanceRecord, Employee } from '../../types/attendance';
+import { normalizeAvatarUrl, initialsAvatarDataUrl } from '../../utils/avatar';
 import { 
   buildDailySummary, 
   formatDateSpanish, 
@@ -256,7 +257,8 @@ export const WeeklyReport: React.FC<WeeklyReportProps> = ({ employees, records }
                   <td className="py-3 px-4">
                     <div className="flex items-center gap-2.5">
                       <img
-                        src={row.employee.avatarUrl}
+                        src={normalizeAvatarUrl(row.employee.avatarUrl)}
+                          onError={(e) => { const t = e.currentTarget as HTMLImageElement; if (!t.dataset.fallback) { t.dataset.fallback = '1'; t.src = initialsAvatarDataUrl(row.employee.firstName); } }}
                         alt={row.employee.firstName}
                         className="w-8 h-8 rounded-lg object-cover border border-slate-700 shrink-0"
                       />

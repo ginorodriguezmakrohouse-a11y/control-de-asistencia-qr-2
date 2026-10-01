@@ -203,149 +203,6 @@ export const INITIAL_EMPLOYEES: Employee[] = [
   },
 ];
 
-// Generate seed attendance records for realistic report previews
-export function generateSeedRecords(): AttendanceRecord[] {
-  const records: AttendanceRecord[] = [];
-  const today = getTodayDateStr();
-
-  // Create attendance for today and previous 6 days
-  const todayDate = new Date();
-  
-  for (let i = 6; i >= 0; i--) {
-    const d = new Date(todayDate);
-    d.setDate(todayDate.getDate() - i);
-    // skip sundays for sample
-    if (d.getDay() === 0) continue;
-
-    const y = d.getFullYear();
-    const m = String(d.getMonth() + 1).padStart(2, '0');
-    const day = String(d.getDate()).padStart(2, '0');
-    const dateStr = `${y}-${m}-${day}`;
-    const isCurrentDay = dateStr === today;
-
-    INITIAL_EMPLOYEES.forEach((emp, index) => {
-      // simulate some absentees occasionally
-      if (index === 6 && i === 2) return; // Javier was absent 2 days ago
-
-      // 1. Morning in
-      const isLate = index === 3 && i === 1; // Lucía had 1 late arrival
-      const morningMinute = isLate ? '24' : String(50 + (index % 8)).padStart(2, '0');
-      const morningHour = isLate ? '08' : '07';
-      const morningTime = `${morningHour}:${morningMinute}:14`;
-
-      records.push({
-        id: `REC-${dateStr}-${emp.id}-IN`,
-        employeeId: emp.id,
-        employeeName: `${emp.firstName} ${emp.lastName}`,
-        employeeDocument: emp.documentId,
-        department: emp.department,
-        avatarUrl: emp.avatarUrl,
-        type: 'morning_in',
-        timestamp: `${dateStr}T${morningTime}Z`,
-        date: dateStr,
-        time: morningTime,
-        isLate,
-        delayMinutes: isLate ? 24 : 0,
-        terminalName: 'Terminal RR.HH Puerta Principal',
-      });
-
-      // If it's today, only register partial stages for live demonstration
-      if (isCurrentDay) {
-        if (index === 0 || index === 1) {
-          // In lunch or returning
-          records.push({
-            id: `REC-${dateStr}-${emp.id}-LO`,
-            employeeId: emp.id,
-            employeeName: `${emp.firstName} ${emp.lastName}`,
-            employeeDocument: emp.documentId,
-            department: emp.department,
-            avatarUrl: emp.avatarUrl,
-            type: 'lunch_out',
-            timestamp: `${dateStr}T13:05:22Z`,
-            date: dateStr,
-            time: '13:05:22',
-            isLate: false,
-            delayMinutes: 0,
-            terminalName: 'Terminal RR.HH Cafetería',
-          });
-          if (index === 0) {
-            records.push({
-              id: `REC-${dateStr}-${emp.id}-LI`,
-              employeeId: emp.id,
-              employeeName: `${emp.firstName} ${emp.lastName}`,
-              employeeDocument: emp.documentId,
-              department: emp.department,
-              avatarUrl: emp.avatarUrl,
-              type: 'lunch_in',
-              timestamp: `${dateStr}T13:58:10Z`,
-              date: dateStr,
-              time: '13:58:10',
-              isLate: false,
-              delayMinutes: 0,
-              terminalName: 'Terminal RR.HH Cafetería',
-            });
-          }
-        }
-        return;
-      }
-
-      // Past days have full cycle
-      // 2. Lunch out
-      records.push({
-        id: `REC-${dateStr}-${emp.id}-LO`,
-        employeeId: emp.id,
-        employeeName: `${emp.firstName} ${emp.lastName}`,
-        employeeDocument: emp.documentId,
-        department: emp.department,
-        avatarUrl: emp.avatarUrl,
-        type: 'lunch_out',
-        timestamp: `${dateStr}T13:02:11Z`,
-        date: dateStr,
-        time: '13:02:11',
-        isLate: false,
-        delayMinutes: 0,
-        terminalName: 'Terminal RR.HH Cafetería',
-      });
-
-      // 3. Lunch in
-      records.push({
-        id: `REC-${dateStr}-${emp.id}-LI`,
-        employeeId: emp.id,
-        employeeName: `${emp.firstName} ${emp.lastName}`,
-        employeeDocument: emp.documentId,
-        department: emp.department,
-        avatarUrl: emp.avatarUrl,
-        type: 'lunch_in',
-        timestamp: `${dateStr}T13:59:45Z`,
-        date: dateStr,
-        time: '13:59:45',
-        isLate: false,
-        delayMinutes: 0,
-        terminalName: 'Terminal RR.HH Cafetería',
-      });
-
-      // 4. Shift out
-      records.push({
-        id: `REC-${dateStr}-${emp.id}-OUT`,
-        employeeId: emp.id,
-        employeeName: `${emp.firstName} ${emp.lastName}`,
-        employeeDocument: emp.documentId,
-        department: emp.department,
-        avatarUrl: emp.avatarUrl,
-        type: 'shift_out',
-        timestamp: `${dateStr}T17:08:33Z`,
-        date: dateStr,
-        time: '17:08:33',
-        isLate: false,
-        delayMinutes: 0,
-        terminalName: 'Terminal RR.HH Puerta Principal',
-      });
-    });
-  }
-
-  return records;
-}
-
 export const StorageService = {
   getEmployees(): Employee[] {
     try {
@@ -370,11 +227,11 @@ export const StorageService = {
 
   getRecords(): AttendanceRecord[] {
     try {
+      // Ya no se siembran registros de demostración: sin datos guardados
+      // la base local empieza vacía (solo marcaciones reales).
       const data = localStorage.getItem(STORAGE_KEYS.RECORDS);
       if (!data) {
-        const seeded = generateSeedRecords();
-        localStorage.setItem(STORAGE_KEYS.RECORDS, JSON.stringify(seeded));
-        return seeded;
+        return [];
       }
       return JSON.parse(data);
     } catch {
@@ -392,7 +249,21 @@ export const StorageService = {
 
   addRecord(record: AttendanceRecord): AttendanceRecord[] {
     const current = this.getRecords();
-    const updated = [record, ...current];
+    // Deduplicación por (empleado+tipo+fecha): si ya existe el mismo
+    // movimiento del día, se reemplaza en vez de insertar un duplicado.
+    const dupIdx = current.findIndex(
+      r =>
+        r.employeeId === record.employeeId &&
+        r.type === record.type &&
+        r.date === record.date
+    );
+    let updated: AttendanceRecord[];
+    if (dupIdx !== -1) {
+      updated = [...current];
+      updated[dupIdx] = record;
+    } else {
+      updated = [record, ...current];
+    }
     this.saveRecords(updated);
     return updated;
   },
@@ -418,9 +289,6 @@ export const StorageService = {
     }
   },
 
-  resetToDefault(): void {
-    localStorage.removeItem(STORAGE_KEYS.EMPLOYEES);
-    localStorage.removeItem(STORAGE_KEYS.RECORDS);
-    localStorage.removeItem(STORAGE_KEYS.CONFIG);
-  },
+  // (Eliminado "restablecer datos de demostración": la app ya no siembra
+  // registros ficticios y el botón fue quitado de Configuración.)
 };

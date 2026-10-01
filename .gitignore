@@ -1,15 +1,1 @@
-# Dependencies
-node_modules/
-
-# Build artifacts
-dist/
-
-# Environment
-.env
-.env.local
-.env.*.local
-
-# Logs / OS
-*.log
-.DS_Store
-.netlify/
+(empty)

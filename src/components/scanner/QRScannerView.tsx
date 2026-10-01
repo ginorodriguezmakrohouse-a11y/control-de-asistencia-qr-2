@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { 
   Camera, 
   CameraOff, 
@@ -22,6 +22,25 @@ import {
   Info
 } from 'lucide-react';
 import { Html5Qrcode, Html5QrcodeScannerState } from 'html5-qrcode';
+
+// Id del contenedor de video. Se usa un id único por instancia (UUID) en lugar
+// de uno fijo: html5-qrcode busca el elemento con document.getElementById y,
+// si hay dos lectores montados a la vez o restos de un montaje anterior
+// (React StrictMode), el segundo "clear()" vaciaba el div del primero y la
+// cámara quedaba en negro / fallaba al arrancar la cámara trasera.
+const SCANNER_ELEMENT_ID = `qr-reader-${crypto.randomUUID()}`;
+const FILE_DECODER_ELEMENT_ID = `qr-file-decoder-${crypto.randomUUID()}`;
+
+// El navegador no siempre entrega la cámara trasera con facingMode:'environment'
+// (en muchos Android Chrome devuelve la frontal). Esta heurística prioriza las
+// cámaras traseras reportadas por enumerateDevices.
+const isLikelyRearCamera = (label: string): boolean =>
+  /(back|rear|atr[aá]s|trasera|environment)/i.test(label);
+
+const rankCamerasForRear = (devices: Array<{ id: string; label: string }>): Array<{ id: string; label: string }> => {
+  const scored = devices.map((d, index) => ({ d, index, score: isLikelyRearCamera(d.label) ? 0 : 1 }));
+  return scored.sort((a, b) => a.score - b.score || a.index - b.index).map(s => s.d);
+};
 import confetti from 'canvas-confetti';
 import { 
   AttendanceEventType, 
@@ -38,12 +57,17 @@ import {
   getTodayDateStr 
 } from '../../utils/timeCalculations';
 import { sounds } from '../../utils/audio';
+import { parseDailyQrPayload, buildDailyQrPayload, serializeDailyQrPayload } from '../../lib/dailyQr';
+import { normalizeAvatarUrl, initialsAvatarDataUrl } from '../../utils/avatar';
 
 interface QRScannerViewProps {
   employees: Employee[];
   records: AttendanceRecord[];
   config: SystemConfig;
-  onAddRecord: (record: AttendanceRecord) => void;
+  // Debe devolver una promesa que se resuelve cuando el registro quedó
+  // persistido (Supabase y/o almacenamiento local). El escáner la espera
+  // antes de cerrar la ventana del lector.
+  onAddRecord: (record: AttendanceRecord) => Promise<void> | void;
 }
 
 export const QRScannerView: React.FC<QRScannerViewProps> = ({
@@ -63,6 +87,22 @@ export const QRScannerView: React.FC<QRScannerViewProps> = ({
   const [permissionStatus, setPermissionStatus] = useState<string>('desconocido');
 
   const html5QrCodeRef = useRef<Html5Qrcode | null>(null);
+  // Evita que dos intentos de arranque/parada se solapen (condición de carrera
+  // que dejaba el lector en un estado inconsistente y la cámara "fallando").
+  const cameraOperationLockRef = useRef<boolean>(false);
+
+  // === BLOQUEO ASÍNCRONO ANTI-DUPLICADOS (registro múltiple) ===
+  // scanCooldown e isRegistering son ESTADOS de React: entre que html5-qrcode
+  // dispara onSuccess varias veces en el mismo tick y React re-renderiza, los
+  // closures antiguos aún ven los valores viejos y cada callback registraba su
+  // propio registro. Los refs se actualizan de forma síncrona, antes del await,
+  // garantizando que SOLO el primer escaneo de un código avanza al registro.
+  const processingRef = useRef<boolean>(false);
+  const lastProcessedPayloadRef = useRef<string>('');
+  const lastProcessedAtRef = useRef<number>(0);
+  // Claves "empleado+tipo" ya registradas durante esta sesión de lectura.
+  // Se limpian al cerrar/reabrir el lector o al pulsar "Escanear otro".
+  const sessionKeysRef = useRef<Set<string>>(new Set());
 
   // Manual or barcode input
   const [manualCode, setManualCode] = useState<string>('');
@@ -79,6 +119,12 @@ export const QRScannerView: React.FC<QRScannerViewProps> = ({
   } | null>(null);
 
   const [scanCooldown, setScanCooldown] = useState<boolean>(false);
+  // Estado de registro: true mientras el escaneo se persiste en Supabase.
+  // Al completarse correctamente se CIERRA la ventana del lector (cámara).
+  const [isRegistering, setIsRegistering] = useState<boolean>(false);
+  // Controla si la "ventana" del lector de QR está abierta (visor de cámara
+  // visible). Se cierra automáticamente al registrar una marcación.
+  const [showReader, setShowReader] = useState<boolean>(true);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [quickSearchTerm, setQuickSearchTerm] = useState<string>('');
   const [showSimDrawer, setShowSimDrawer] = useState<boolean>(true);
@@ -86,8 +132,18 @@ export const QRScannerView: React.FC<QRScannerViewProps> = ({
   // File upload scan ref
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  // Today's records for display
-  const todayDateStr = getTodayDateStr();
+  // Tick de "hora actual": avanza cada minuto para que la fecha de hoy se
+  // recalcule automáticamente al cruzar la medianoche sin recargar el terminal.
+  const [nowTick, setNowTick] = useState<number>(() => Date.now());
+  useEffect(() => {
+    const intervalId = window.setInterval(() => setNowTick(Date.now()), 60_000);
+    return () => window.clearInterval(intervalId);
+  }, []);
+
+  // Fecha de HOY recalculada periódicamente: si el terminal queda abierto
+  // pasada la medianoche, los QR diarios siguen validándose contra el día
+  // correcto y las listas del panel muestran el día actual.
+  const todayDateStr = useMemo(() => getTodayDateStr(), [nowTick]);
   const todayRecords = records.filter(r => r.date === todayDateStr);
 
   // Check browser permissions if supported
@@ -119,147 +175,306 @@ export const QRScannerView: React.FC<QRScannerViewProps> = ({
         }));
         setCameras(mapped);
         if (!selectedCameraId || !mapped.some(c => c.id === selectedCameraId)) {
-          setSelectedCameraId(mapped[0].id);
+          // Por defecto elegir la cámara TRASERA si está disponible
+          // (rankCamerasForRear prioriza las etiquetas back/rear/atrás),
+          // en lugar de la primera de la lista que suele ser la frontal.
+          const preferred = facingMode === 'environment'
+            ? rankCamerasForRear(mapped)[0]
+            : mapped.find(c => !isLikelyRearCamera(c.label)) ?? mapped[0];
+          setSelectedCameraId(preferred.id);
         }
       }
     } catch {
       // Permission might not yet be granted
     }
-  }, [selectedCameraId]);
+  }, [selectedCameraId, facingMode]);
 
   useEffect(() => {
     checkPermissionState();
     refreshCameras();
   }, [checkPermissionState, refreshCameras]);
 
+  // Stop camera helper: detiene el video y LIBERA la cámara del dispositivo.
+  const stopCamera = useCallback(async () => {
+    if (html5QrCodeRef.current) {
+      try {
+        const state = html5QrCodeRef.current.getState();
+        if (state === Html5QrcodeScannerState.SCANNING || state === Html5QrcodeScannerState.PAUSED) {
+          await html5QrCodeRef.current.stop();
+        }
+        html5QrCodeRef.current.clear();
+      } catch (err) {
+        console.warn('Error clearing scanner:', err);
+      }
+      html5QrCodeRef.current = null;
+    }
+    setIsScanning(false);
+    setIsStartingCamera(false);
+  }, []);
+
+  // "Cerrar la ventana del lector de QR": deja de mostrar el visor de la
+  // cámara y muestra una tarjeta de confirmación con botón para volver a
+  // escanear. La cámara se detiene aparte (stopCamera) para liberarla.
+  const closeReaderWindow = useCallback(() => {
+    setShowReader(false);
+  }, []);
+
+  // Reanudar el decodificador tras un escaneo NO registrado (código no
+  // reconocido, empleado desactivado o error de red): la cámara sigue viva,
+  // solo habíamos pausado la lectura de frames para evitar duplicados.
+  const resumeDecodingIfPaused = useCallback(async () => {
+    const inst = html5QrCodeRef.current;
+    if (!inst) return;
+    try {
+      if (inst.getState() === Html5QrcodeScannerState.PAUSED) {
+        await inst.resume();
+      }
+    } catch {
+      // Si resume falla, el usuario puede reactivar la cámara manualmente.
+    }
+  }, []);
+
   // Process a QR code or employee ID string
-  const handleProcessScan = useCallback((payload: string) => {
-    if (scanCooldown) return;
+  const handleProcessScan = useCallback(async (payload: string) => {
+    if (scanCooldown || isRegistering) return;
     const cleanPayload = payload.trim();
     if (!cleanPayload) return;
 
-    // Search employee by qrPayload, id, or documentId (solo coincidencia exacta:
-    // el "includes" laxo podía hacer match con el empleado equivocado).
-    const lp = cleanPayload.toLowerCase();
-    const codeMatch = lp.match(/(?:code|qr|id)=([^&\s]+)/);
-    const matchedEmployee = employees.find(
-      e => 
-        e.qrPayload.toLowerCase() === lp ||
-        e.id.toLowerCase() === lp ||
-        e.documentId.toLowerCase() === lp ||
-        // tolerar QR que envuelve el payload, p.ej. "https://...?code=QR-EMP-1001"
-        (!!codeMatch && (
-          codeMatch[1] === e.qrPayload.toLowerCase() ||
-          codeMatch[1] === e.id.toLowerCase() ||
-          codeMatch[1] === e.documentId.toLowerCase()
-        ))
-    );
+    // === GUARDAS SINCRÓNICAS ANTI-REGISTRO-MÚLTIPLE ===
+    // (1) Bloqueo de proceso: solo un escaneo puede estar en curso. Como el
+    // flag es un REF, se activa inmediatamente — los callbacks que html5-qrcode
+    // lance en el mismo tick (fps 15) quedan descartados aunque React aún no
+    // haya re-renderizado.
+    if (processingRef.current) return;
+    processingRef.current = true;
 
-    if (!matchedEmployee) {
-      if (config.soundEnabled) sounds.playError();
-      setErrorMessage(`Código QR "${cleanPayload}" no reconocido en el sistema.`);
-      setTimeout(() => setErrorMessage(null), 4000);
+    // (2) Mismo código repetido dentro de 3s => rebote del lector o pistola
+    // USB que envía Enter doble. Se descarta sin registrar.
+    const nowMs = Date.now();
+    if (
+      cleanPayload.toLowerCase() === lastProcessedPayloadRef.current &&
+      nowMs - lastProcessedAtRef.current < 3000
+    ) {
+      processingRef.current = false;
       return;
     }
 
-    if (!matchedEmployee.active) {
-      if (config.soundEnabled) sounds.playError();
-      setErrorMessage(`El empleado ${matchedEmployee.firstName} ${matchedEmployee.lastName} se encuentra DESACTIVADO.`);
-      setTimeout(() => setErrorMessage(null), 4000);
-      return;
-    }
-
-    // Determine event type
-    const empTodayRecords = todayRecords.filter(r => r.employeeId === matchedEmployee.id);
-    let eventTypeToRegister: AttendanceEventType;
-
-    if (selectedEventType === 'auto') {
-      const nextDecision = determineNextAttendanceEvent(matchedEmployee, empTodayRecords);
-      eventTypeToRegister = nextDecision.suggestedType;
-    } else {
-      eventTypeToRegister = selectedEventType;
-    }
-
-    const currentTime = getCurrentTimeStr();
-    const nowIso = new Date().toISOString();
-
-    // Check if late for morning entry
-    let isLate = false;
-    let delayMinutes = 0;
-    if (eventTypeToRegister === 'morning_in') {
-      const lateCheck = checkIsLate(
-        currentTime,
-        matchedEmployee.schedule.entryTime,
-        matchedEmployee.schedule.toleranceMinutes
-      );
-      isLate = lateCheck.isLate;
-      delayMinutes = lateCheck.delayMinutes;
-    }
-
-    const newRecord: AttendanceRecord = {
-      // randomUUID evita colisiones de PRIMARY KEY al marcar dos terminales
-      // el mismo milisegundo (Date.now() era predecible/duplicable).
-      id: (typeof crypto !== 'undefined' && 'randomUUID' in crypto)
-        ? `REC-${crypto.randomUUID()}`
-        : `REC-${Date.now()}-${Math.random().toString(36).slice(2, 10)}-${matchedEmployee.id}`,
-      employeeId: matchedEmployee.id,
-      employeeName: `${matchedEmployee.firstName} ${matchedEmployee.lastName}`,
-      employeeDocument: matchedEmployee.documentId,
-      department: matchedEmployee.department,
-      avatarUrl: matchedEmployee.avatarUrl,
-      type: eventTypeToRegister,
-      timestamp: nowIso,
-      date: todayDateStr,
-      time: currentTime,
-      isLate,
-      delayMinutes,
-      terminalName: 'Terminal Principal RR.HH',
-    };
-
-    onAddRecord(newRecord);
-
-    // Audio & Visual feedback
-    if (config.soundEnabled) {
-      if (isLate) {
-        sounds.playWarning();
-      } else {
-        sounds.playSuccess();
-      }
-    }
-
-    // Small celebratory confetti for on-time morning entry
-    if (eventTypeToRegister === 'morning_in' && !isLate) {
+    try {
+      // Pausar el decodificador inmediatamente: evita que la misma persona
+      // frente a la cámara genere escaneos duplicados mientras se registra.
       try {
-        confetti({
-          particleCount: 25,
-          spread: 40,
-          origin: { y: 0.7 },
-        });
+        const inst = html5QrCodeRef.current;
+        if (inst && inst.getState() === Html5QrcodeScannerState.SCANNING) {
+          await inst.pause(true);
+        }
       } catch {
-        // ignore
+        // Si pausa falla, el cierre/registro posterior lo controla igual.
       }
+
+      // Search employee by qrPayload, id, or documentId (solo coincidencia exacta:
+      // el "includes" laxo podía hacer match con el empleado equivocado).
+      const lp = cleanPayload.toLowerCase();
+      const codeMatch = lp.match(/(?:code|qr|id)=([^&\s]+)/);
+
+      // === QR DIARIO (JSON con datos del colaborador + fecha) ===
+      // Formato: {"v":1,"id":"EMP-1001","doc":"...","name":"...","dep":"...","date":"YYYY-MM-DD"}
+      // Si trae una fecha distinta a hoy, se rechaza (el código caduca cada día).
+      const dailyQr = parseDailyQrPayload(cleanPayload);
+      if (dailyQr && dailyQr.date !== todayDateStr) {
+        if (config.soundEnabled) sounds.playError();
+        setErrorMessage(
+          `El código QR de ${dailyQr.name || dailyQr.id} es del día ${dailyQr.date} y ya no es válido. Se requiere el QR diario de hoy.`
+        );
+        setTimeout(() => setErrorMessage(null), 4000);
+        await resumeDecodingIfPaused();
+        return;
+      }
+
+      const identityTokens: string[] = [];
+      if (dailyQr) {
+        if (dailyQr.id) identityTokens.push(dailyQr.id.toLowerCase());
+        if (dailyQr.doc) identityTokens.push(dailyQr.doc.toLowerCase());
+      } else {
+        identityTokens.push(lp);
+        if (codeMatch) identityTokens.push(codeMatch[1]);
+      }
+
+      const matchedEmployee = employees.find(e =>
+        identityTokens.some(
+          token =>
+            e.qrPayload.toLowerCase() === token ||
+            e.id.toLowerCase() === token ||
+            e.documentId.toLowerCase() === token
+        )
+      );
+
+      if (!matchedEmployee) {
+        if (config.soundEnabled) sounds.playError();
+        setErrorMessage(`Código QR "${cleanPayload}" no reconocido en el sistema.`);
+        setTimeout(() => setErrorMessage(null), 4000);
+        // No se registró nada: reanudar la lectura para permitir otro escaneo.
+        await resumeDecodingIfPaused();
+        return;
+      }
+
+      if (!matchedEmployee.active) {
+        if (config.soundEnabled) sounds.playError();
+        setErrorMessage(`El empleado ${matchedEmployee.firstName} ${matchedEmployee.lastName} se encuentra DESACTIVADO.`);
+        setTimeout(() => setErrorMessage(null), 4000);
+        await resumeDecodingIfPaused();
+        return;
+      }
+
+      // Determine event type
+      const empTodayRecords = todayRecords.filter(r => r.employeeId === matchedEmployee.id);
+      let eventTypeToRegister: AttendanceEventType;
+
+      if (selectedEventType === 'auto') {
+        const nextDecision = determineNextAttendanceEvent(matchedEmployee, empTodayRecords);
+        eventTypeToRegister = nextDecision.suggestedType;
+      } else {
+        eventTypeToRegister = selectedEventType;
+      }
+
+      // (3) Deduplicación por sesión: si este empleado+tipo ya quedó registrado
+      // en esta sesión de lectura, NO volver a insertar (evita filas duplicadas
+      // en attendance_records cuando el lector dispara el mismo QR otra vez).
+      const sessionKey = `${matchedEmployee.id}:${eventTypeToRegister}`;
+      if (sessionKeysRef.current.has(sessionKey)) {
+        if (config.soundEnabled) sounds.playError();
+        setErrorMessage('Esta marcación ya fue registrada en esta sesión. Escanea otro código o pulsa "Escanear otro".');
+        setTimeout(() => setErrorMessage(null), 4000);
+        await resumeDecodingIfPaused();
+        return;
+      }
+
+      const currentTime = getCurrentTimeStr();
+      const nowIso = new Date().toISOString();
+
+      // Check if late for morning entry
+      let isLate = false;
+      let delayMinutes = 0;
+      if (eventTypeToRegister === 'morning_in') {
+        const lateCheck = checkIsLate(
+          currentTime,
+          matchedEmployee.schedule.entryTime,
+          matchedEmployee.schedule.toleranceMinutes
+        );
+        isLate = lateCheck.isLate;
+        delayMinutes = lateCheck.delayMinutes;
+      }
+
+      const newRecord: AttendanceRecord = {
+        // randomUUID evita colisiones de PRIMARY KEY al marcar dos terminales
+        // el mismo milisegundo (Date.now() era predecible/duplicable).
+        id: (typeof crypto !== 'undefined' && 'randomUUID' in crypto)
+          ? `REC-${crypto.randomUUID()}`
+          : `REC-${Date.now()}-${Math.random().toString(36).slice(2, 10)}-${matchedEmployee.id}`,
+        employeeId: matchedEmployee.id,
+        employeeName: `${matchedEmployee.firstName} ${matchedEmployee.lastName}`,
+        employeeDocument: matchedEmployee.documentId,
+        department: matchedEmployee.department,
+        avatarUrl: matchedEmployee.avatarUrl,
+        type: eventTypeToRegister,
+        timestamp: nowIso,
+        date: todayDateStr,
+        time: currentTime,
+        isLate,
+        delayMinutes,
+        terminalName: 'Terminal Principal RR.HH',
+      };
+
+      // Marcar el payload como procesado ANTES del await: cualquier callback
+      // pendiente del mismo código queda descartado por las guardas (1)-(3).
+      lastProcessedPayloadRef.current = lp;
+      lastProcessedAtRef.current = Date.now();
+      sessionKeysRef.current.add(sessionKey);
+
+      // === PASO 1: Registrar la entrada/salida en Supabase (vía onAddRecord,
+      // que persiste en attendance_records y hace fallback local). El escáner
+      // ESPERA a que el registro se confirme antes de cerrar el lector. ===
+      setIsRegistering(true);
+      try {
+        await Promise.resolve(onAddRecord(newRecord));
+      } catch (err) {
+        console.error('Error al registrar la marcación:', err);
+        if (config.soundEnabled) sounds.playError();
+        setErrorMessage('No se pudo guardar la marcación (error de conexión con Supabase). Inténtalo de nuevo.');
+        setTimeout(() => setErrorMessage(null), 5000);
+        setIsRegistering(false);
+        // El registro FALLÓ: quitar la clave de sesión para permitir reintentar
+        // el mismo código, y reanudar la lectura.
+        sessionKeysRef.current.delete(sessionKey);
+        await resumeDecodingIfPaused();
+        return;
+      }
+      setIsRegistering(false);
+
+      // Audio & Visual feedback
+      if (config.soundEnabled) {
+        if (isLate) {
+          sounds.playWarning();
+        } else {
+          sounds.playSuccess();
+        }
+      }
+
+      // Small celebratory confetti for on-time morning entry
+      if (eventTypeToRegister === 'morning_in' && !isLate) {
+        try {
+          confetti({
+            particleCount: 25,
+            spread: 40,
+            origin: { y: 0.7 },
+          });
+        } catch {
+          // ignore
+        }
+      }
+
+      setLastScanResult({
+        record: newRecord,
+        employee: matchedEmployee,
+        eventMeta: EVENT_LABELS[eventTypeToRegister],
+        message: isLate 
+          ? `Tardanza registrada (+${delayMinutes} min sobre tolerancia)`
+          : '¡Marcación registrada correctamente!',
+        isLate,
+        delayMinutes,
+      });
+
+      setErrorMessage(null);
+      setManualCode('');
+
+      // === PASO 2: Una vez registrado el dato, CERRAR la ventana del lector
+      // de código QR: se detiene y libera la cámara y se oculta el visor,
+      // mostrando la tarjeta de confirmación con botón "Escanear otro". ===
+      await stopCamera();
+      closeReaderWindow();
+
+      // Prevent immediate double scan (1.8s cooldown)
+      setScanCooldown(true);
+      setTimeout(() => {
+        setScanCooldown(false);
+      }, 1800);
+    } finally {
+      // Liberar el bloqueo síncrono SIEMPRE, incluso si alguna fase lanza una
+      // excepción inesperada (antes un error dejaba el lector inutilizable).
+      processingRef.current = false;
     }
-
-    setLastScanResult({
-      record: newRecord,
-      employee: matchedEmployee,
-      eventMeta: EVENT_LABELS[eventTypeToRegister],
-      message: isLate 
-        ? `Tardanza registrada (+${delayMinutes} min sobre tolerancia)`
-        : '¡Marcación registrada correctamente!',
-      isLate,
-      delayMinutes,
-    });
-
-    setErrorMessage(null);
-    setManualCode('');
-
-    // Prevent immediate double scan (1.8s cooldown)
-    setScanCooldown(true);
-    setTimeout(() => {
-      setScanCooldown(false);
-    }, 1800);
-  }, [scanCooldown, employees, todayRecords, selectedEventType, config.soundEnabled, todayDateStr, onAddRecord]);
+  }, [
+    scanCooldown,
+    isRegistering,
+    employees,
+    todayRecords,
+    selectedEventType,
+    config.soundEnabled,
+    todayDateStr,
+    onAddRecord,
+    stopCamera,
+    closeReaderWindow,
+    resumeDecodingIfPaused,
+  ]);
 
   // Handle hardware USB barcode / QR scanner keystrokes
   useEffect(() => {
@@ -293,54 +508,43 @@ export const QRScannerView: React.FC<QRScannerViewProps> = ({
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [handleProcessScan]);
 
-  // Stop camera helper
-  const stopCamera = useCallback(async () => {
-    if (html5QrCodeRef.current) {
-      try {
-        const state = html5QrCodeRef.current.getState();
-        if (state === Html5QrcodeScannerState.SCANNING || state === Html5QrcodeScannerState.PAUSED) {
-          await html5QrCodeRef.current.stop();
-        }
-        await html5QrCodeRef.current.clear();
-      } catch (err) {
-        console.warn('Error clearing scanner:', err);
-      }
-      html5QrCodeRef.current = null;
-    }
-    setIsScanning(false);
-    setIsStartingCamera(false);
-  }, []);
-
   // Robust camera starter with cascade fallback
   const startCamera = async (targetFacingMode: 'environment' | 'user' = facingMode, targetCameraId?: string) => {
+    // Bloqueo anti-solapamiento: si el usuario pulsa "Activar"/"Reintentar"
+    // varias veces, los intentos concurrentes dejaban al lector en un estado
+    // inconsistente (cámara iniciada dos veces / track fantasma).
+    if (cameraOperationLockRef.current) {
+      return;
+    }
+    cameraOperationLockRef.current = true;
     setCameraError(null);
     setIsStartingCamera(true);
 
-    // 1. Verify browser supports mediaDevices
-    if (!navigator?.mediaDevices?.getUserMedia) {
-      setCameraError({
-        title: 'Cámara no soportada en este entorno',
-        message: 'Tu navegador o conexión actual no permite acceso directo a la cámara (se requiere conexión HTTPS o localhost). Puedes utilizar el ingreso manual, pistolas USB o subir la imagen del QR.',
-        type: 'generic',
-      });
-      setIsStartingCamera(false);
-      return;
-    }
-
     try {
+      // 1. Verify browser supports mediaDevices (getUserMedia solo funciona en
+      //    contexto seguro: HTTPS o localhost).
+      if (!window.isSecureContext || !navigator?.mediaDevices?.getUserMedia) {
+        setCameraError({
+          title: window.isSecureContext ? 'Cámara no soportada en este navegador' : 'Se requiere una conexión segura (HTTPS)',
+          message: 'Tu navegador o conexión actual no permite acceso directo a la cámara (se requiere conexión HTTPS o localhost). Puedes utilizar el ingreso manual, pistolas USB o subir la imagen del QR.',
+          type: 'generic',
+        });
+        return;
+      }
+
       // Clean previous instance if active
       if (html5QrCodeRef.current) {
         await stopCamera();
       }
 
-      const container = document.getElementById('qr-reader-container');
+      const container = document.getElementById(SCANNER_ELEMENT_ID);
       if (!container) {
         throw new Error('Elemento contenedor del lector no encontrado');
       }
       // Ensure container is clean
       container.innerHTML = '';
 
-      const qrScanner = new Html5Qrcode('qr-reader-container', { verbose: false });
+      const qrScanner = new Html5Qrcode(SCANNER_ELEMENT_ID, { verbose: false });
       html5QrCodeRef.current = qrScanner;
 
       const scanConfig = {
@@ -350,6 +554,8 @@ export const QRScannerView: React.FC<QRScannerViewProps> = ({
           const edgeSize = Math.max(160, Math.floor(minEdge * 0.72));
           return { width: edgeSize, height: edgeSize };
         },
+        // Refuerza la solicitud de cámara trasera cuando el navegador lo admite
+        videoConstraints: { facingMode: targetFacingMode },
       };
 
       const onScanSuccess = (decodedText: string) => {
@@ -360,9 +566,23 @@ export const QRScannerView: React.FC<QRScannerViewProps> = ({
         // Frame-by-frame scanner errors are normal when no QR is in view
       };
 
-      // Attempt 1: Target camera ID if explicitly provided or selected
-      const camIdToTry = targetCameraId || (selectedCameraId && selectedCameraId.length > 5 ? selectedCameraId : null);
       let startedSuccessfully = false;
+
+      // Attempt 1: Target camera ID if explicitly provided or selected.
+      // Si se pidió la cámara trasera y hay varias, priorizar la etiquetada
+      // como back/rear/atrás: con facingMode:'environment' muchos navegadores
+      // (p. ej. Chrome en Android) devuelven igualmente la frontal.
+      let camIdToTry = targetCameraId || (selectedCameraId && selectedCameraId.length > 5 ? selectedCameraId : null);
+      if (camIdToTry && targetFacingMode === 'environment' && cameras.length > 1) {
+        const current = cameras.find(c => c.id === camIdToTry);
+        if (current && !isLikelyRearCamera(current.label)) {
+          const rear = rankCamerasForRear(cameras)[0];
+          if (rear && isLikelyRearCamera(rear.label)) {
+            camIdToTry = rear.id;
+            setSelectedCameraId(rear.id);
+          }
+        }
+      }
 
       if (camIdToTry) {
         try {
@@ -406,15 +626,35 @@ export const QRScannerView: React.FC<QRScannerViewProps> = ({
       }
 
       setIsScanning(true);
-      setIsStartingCamera(false);
       setPermissionStatus('granted');
+      // La cámara es la "ventana del lector": al encenderse, el visor vuelve
+      // a mostrarse (p. ej. tras cerrarse automáticamente al registrar).
+      setShowReader(true);
+      // Nueva sesión de lectura: se limpia la deduplicación previa para que
+      // los empleados puedan volver a marcar (entrada/salida) en esta sesión.
+      sessionKeysRef.current.clear();
 
       // Refresh camera labels now that permission is granted
       refreshCameras();
     } catch (err: unknown) {
       console.error('Camera startup error:', err);
       setIsScanning(false);
-      setIsStartingCamera(false);
+
+      // Liberar cualquier instancia a medio iniciar para no dejar la cámara
+      // "secuestrada" (NotReadableError en el siguiente intento).
+      if (html5QrCodeRef.current) {
+        try {
+          await html5QrCodeRef.current.stop();
+        } catch {
+          // ignore
+        }
+        try {
+          html5QrCodeRef.current.clear();
+        } catch {
+          // ignore
+        }
+        html5QrCodeRef.current = null;
+      }
 
       const errorStr = String(err);
       if (errorStr.includes('NotAllowedError') || errorStr.includes('PermissionDeniedError') || errorStr.includes('denied')) {
@@ -436,6 +676,12 @@ export const QRScannerView: React.FC<QRScannerViewProps> = ({
           message: 'La cámara parece estar ocupada por otra app (Zoom, Google Meet, Teams u otra pestaña del navegador). Cierra esas aplicaciones y pulsa "Reintentar".',
           type: 'inUse',
         });
+      } else if (errorStr.includes('OverconstrainedError')) {
+        setCameraError({
+          title: 'La cámara trasera no está disponible',
+          message: 'El dispositivo no expone una cámara trasera accesible desde el navegador, o el identificador de cámara cambió. Prueba con "Probar con otra cámara" o selecciónala en el desplegable.',
+          type: 'notFound',
+        });
       } else {
         setCameraError({
           title: 'Error de Conexión de Cámara',
@@ -443,6 +689,9 @@ export const QRScannerView: React.FC<QRScannerViewProps> = ({
           type: 'generic',
         });
       }
+    } finally {
+      setIsStartingCamera(false);
+      cameraOperationLockRef.current = false;
     }
   };
 
@@ -450,7 +699,8 @@ export const QRScannerView: React.FC<QRScannerViewProps> = ({
   const handleToggleFacingMode = async () => {
     const newFacing = facingMode === 'environment' ? 'user' : 'environment';
     setFacingMode(newFacing);
-    setSelectedCameraId('');
+    // No vaciar selectedCameraId: startCamera re-prioriza automáticamente la
+    // cámara adecuada para el nuevo modo (trasera/frontal) según las etiquetas.
     if (isScanning) {
       await stopCamera();
       startCamera(newFacing);
@@ -460,19 +710,42 @@ export const QRScannerView: React.FC<QRScannerViewProps> = ({
   // Change specific camera from dropdown
   const handleCameraChange = async (cameraId: string) => {
     setSelectedCameraId(cameraId);
+    // Sincronizar el indicador frontal/trasera con la cámara elegida
+    const chosen = cameras.find(c => c.id === cameraId);
+    if (chosen) {
+      setFacingMode(isLikelyRearCamera(chosen.label) ? 'environment' : 'user');
+    }
     if (isScanning) {
       await stopCamera();
       startCamera(facingMode, cameraId);
+    } else {
+      // Si la ventana del lector estaba cerrada (tras un registro), al
+      // cambiar de cámara se vuelve a abrir su visor.
+      setShowReader(true);
     }
   };
 
-  // Cleanup on unmount
+  // Cleanup on unmount: detener e limpiar SIEMPRE (antes solo se hacía si
+  // estaba escaneando, dejando tracks de cámara vivos al cambiar de vista).
   useEffect(() => {
     return () => {
       if (html5QrCodeRef.current) {
         try {
-          if (html5QrCodeRef.current.isScanning) {
-            html5QrCodeRef.current.stop();
+          const state = html5QrCodeRef.current.getState();
+          if (state === Html5QrcodeScannerState.SCANNING || state === Html5QrcodeScannerState.PAUSED) {
+            html5QrCodeRef.current.stop().then(() => {
+              try {
+                html5QrCodeRef.current?.clear();
+              } catch {
+                // ignore
+              }
+              html5QrCodeRef.current = null;
+            }).catch(() => {
+              html5QrCodeRef.current = null;
+            });
+          } else {
+            html5QrCodeRef.current.clear();
+            html5QrCodeRef.current = null;
           }
         } catch {
           // ignore
@@ -487,19 +760,19 @@ export const QRScannerView: React.FC<QRScannerViewProps> = ({
     if (!file) return;
 
     try {
-      // Use isolated off-screen element id
-      let fileDecoder = document.getElementById('qr-file-decoder');
+      // Use isolated off-screen element id (único por instancia, ver nota arriba)
+      let fileDecoder = document.getElementById(FILE_DECODER_ELEMENT_ID);
       if (!fileDecoder) {
         fileDecoder = document.createElement('div');
-        fileDecoder.id = 'qr-file-decoder';
+        fileDecoder.id = FILE_DECODER_ELEMENT_ID;
         fileDecoder.style.display = 'none';
         document.body.appendChild(fileDecoder);
       }
 
-      const html5QrCode = new Html5Qrcode('qr-file-decoder');
+      const html5QrCode = new Html5Qrcode(FILE_DECODER_ELEMENT_ID);
       const result = await html5QrCode.scanFile(file, true);
       handleProcessScan(result);
-      await html5QrCode.clear();
+      html5QrCode.clear();
     } catch (err) {
       console.warn('File decode error:', err);
       setErrorMessage('No se encontró un código QR legible en la imagen seleccionada. Asegúrate de que esté bien iluminada y enfocada.');
@@ -739,58 +1012,20 @@ export const QRScannerView: React.FC<QRScannerViewProps> = ({
               </div>
             </div>
 
-            {/* Video Container (Explicit min-height prevents HTML5-QRCode 0px canvas crash) */}
+            {/* Video Container: la "ventana del lector" se muestra solo si showReader.
+                Tras registrar con éxito en Supabase se cierra automáticamente
+                y aparece la tarjeta de confirmación. */}
+            {showReader ? (
             <div className="relative bg-slate-950 rounded-xl overflow-hidden border border-slate-800 min-h-[300px] flex flex-col items-center justify-center">
-              
-              {/* HTML5-QRCode mount node */}
-              <div 
-                id="qr-reader-container" 
-                className="w-full min-h-[300px] [&_video]:w-full [&_video]:h-full [&_video]:min-h-[300px] [&_video]:object-cover" 
+
+              {/* HTML5-QRCode mount node (id único por instancia) */}
+              <div
+                id={SCANNER_ELEMENT_ID}
+                className="w-full min-h-[300px] [&_video]:w-full [&_video]:h-full [&_video]:min-h-[300px] [&_video]:object-cover"
               />
 
-              {/* Inactive State Screen */}
-              {!isScanning && (
-                <div className="absolute inset-0 flex flex-col items-center justify-center p-6 text-center bg-slate-950/95 backdrop-blur-xs">
-                  {isStartingCamera ? (
-                    <div className="flex flex-col items-center gap-3">
-                      <div className="w-12 h-12 border-3 border-emerald-400 border-t-transparent rounded-full animate-spin" />
-                      <p className="text-sm font-bold text-white">Iniciando cámara...</p>
-                      <p className="text-xs text-slate-400 max-w-xs">
-                        Solicitando permisos al navegador y conectando con el sensor de video.
-                      </p>
-                    </div>
-                  ) : (
-                    <>
-                      <div className="w-16 h-16 rounded-2xl bg-slate-800 border border-slate-700 flex items-center justify-center mb-3 text-slate-400">
-                        <CameraOff className="w-8 h-8 text-slate-400" />
-                      </div>
-                      <h4 className="text-base font-bold text-white">Cámara Lista para Conectar</h4>
-                      <p className="text-xs text-slate-400 max-w-xs mt-1 mb-4">
-                        Presiona el botón para encender la cámara y registrar la asistencia de los empleados escaneando su QR.
-                      </p>
-                      <div className="flex flex-wrap items-center justify-center gap-2">
-                        <button
-                          onClick={() => startCamera(facingMode)}
-                          className="px-5 py-2.5 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-sm rounded-xl shadow-lg shadow-emerald-500/25 flex items-center gap-2 transition-all active:scale-95"
-                        >
-                          <Camera className="w-4 h-4" />
-                          Activar Cámara
-                        </button>
-                        <button
-                          onClick={handleToggleFacingMode}
-                          className="px-3 py-2.5 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 font-semibold text-xs rounded-xl flex items-center gap-1.5 transition-all"
-                        >
-                          <SwitchCamera className="w-3.5 h-3.5 text-emerald-400" />
-                          <span>Modo: {facingMode === 'environment' ? 'Trasera' : 'Frontal'}</span>
-                        </button>
-                      </div>
-                    </>
-                  )}
-                </div>
-              )}
-
-              {/* Scanning Reticle Overlay */}
-              {isScanning && (
+              {/* Scanning Reticle Overlay (solo con cámara escaneando) */}
+              {isScanning && !isRegistering && (
                 <div className="absolute inset-0 pointer-events-none flex items-center justify-center">
                   <div className="w-56 h-56 border-2 border-emerald-400/80 rounded-2xl relative shadow-[0_0_25px_rgba(16,185,129,0.35)]">
                     <div className="absolute top-0 left-0 w-4 h-4 border-t-4 border-l-4 border-emerald-400 -mt-1 -ml-1" />
@@ -801,7 +1036,78 @@ export const QRScannerView: React.FC<QRScannerViewProps> = ({
                   </div>
                 </div>
               )}
+
+              {/* Registrando en Supabase... (código detectado, esperando confirmación) */}
+              {isRegistering && (
+                <div className="absolute inset-0 flex flex-col items-center justify-center p-6 text-center bg-slate-950/80 backdrop-blur-xs">
+                  <div className="flex flex-col items-center gap-3">
+                    <div className="w-12 h-12 border-3 border-emerald-400 border-t-transparent rounded-full animate-spin" />
+                    <p className="text-sm font-bold text-white">Registrando marcación en Supabase...</p>
+                    <p className="text-xs text-slate-400 max-w-xs">
+                      Guardando la entrada/salida. La ventana del lector se cerrará al confirmar.
+                    </p>
+                  </div>
+                </div>
+              )}
+
+              {/* Cámara apagada: pantalla de inicio dentro del visor */}
+              {!isScanning && !isStartingCamera && !isRegistering && (
+                <div className="absolute inset-0 flex flex-col items-center justify-center p-6 text-center bg-slate-950/95 backdrop-blur-xs">
+                  <div className="w-16 h-16 rounded-2xl bg-slate-800 border border-slate-700 flex items-center justify-center mb-3 text-slate-400">
+                    <CameraOff className="w-8 h-8 text-slate-400" />
+                  </div>
+                  <h4 className="text-base font-bold text-white">Cámara Lista para Conectar</h4>
+                  <p className="text-xs text-slate-400 max-w-xs mt-1 mb-4">
+                    Presiona el botón para encender la cámara y registrar la asistencia de los empleados escaneando su QR.
+                  </p>
+                  <div className="flex flex-wrap items-center justify-center gap-2">
+                    <button
+                      onClick={() => startCamera(facingMode)}
+                      className="px-5 py-2.5 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-sm rounded-xl shadow-lg shadow-emerald-500/25 flex items-center gap-2 transition-all active:scale-95"
+                    >
+                      <Camera className="w-4 h-4" />
+                      Activar Cámara
+                    </button>
+                    <button
+                      onClick={handleToggleFacingMode}
+                      className="px-3 py-2.5 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 font-semibold text-xs rounded-xl flex items-center gap-1.5 transition-all"
+                    >
+                      <SwitchCamera className="w-3.5 h-3.5 text-emerald-400" />
+                      <span>Modo: {facingMode === 'environment' ? 'Trasera' : 'Frontal'}</span>
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
+            ) : (
+              /* Ventana del lector CERRADA tras registrar: tarjeta de
+                 confirmación con acceso rápido para volver a escanear. */
+              <div className="bg-slate-950 rounded-xl border border-emerald-500/30 min-h-[300px] flex flex-col items-center justify-center p-6 text-center animate-fade-in">
+                <div className="w-16 h-16 rounded-2xl bg-emerald-500/15 border border-emerald-500/40 flex items-center justify-center mb-3">
+                  <CheckCircle2 className="w-8 h-8 text-emerald-400" />
+                </div>
+                <h4 className="text-base font-bold text-white">Marcación registrada correctamente</h4>
+                <p className="text-xs text-slate-400 max-w-xs mt-1 mb-4">
+                  El registro de entrada/salida se guardó en Supabase y la ventana del lector de código QR se cerró.
+                </p>
+                {lastScanResult && (
+                  <div className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-xl border text-xs font-bold mb-4 ${lastScanResult.eventMeta.badgeBg}`}>
+                    <span className="w-2 h-2 rounded-full" style={{ backgroundColor: lastScanResult.eventMeta.color }} />
+                    <span>{lastScanResult.employee.firstName} {lastScanResult.employee.lastName}</span>
+                    <span>•</span>
+                    <span>{lastScanResult.eventMeta.label} ({lastScanResult.record.time})</span>
+                  </div>
+                )}
+                <button
+                  onClick={() => startCamera(facingMode)}
+                  disabled={isStartingCamera}
+                  className="px-5 py-2.5 bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-slate-950 font-bold text-sm rounded-xl shadow-lg shadow-emerald-500/25 flex items-center gap-2 transition-all active:scale-95"
+                >
+                  <Camera className="w-4 h-4" />
+                  {isStartingCamera ? 'Iniciando...' : 'Escanear otro código QR'}
+                </button>
+              </div>
+            )}
 
             {/* Camera action buttons */}
             <div className="mt-3 flex items-center gap-2">
@@ -949,7 +1255,8 @@ export const QRScannerView: React.FC<QRScannerViewProps> = ({
                 {/* Employee Photo */}
                 <div className="relative shrink-0">
                   <img
-                    src={lastScanResult.employee.avatarUrl}
+                    src={normalizeAvatarUrl(lastScanResult.employee.avatarUrl)}
+                          onError={(e) => { const t = e.currentTarget as HTMLImageElement; if (!t.dataset.fallback) { t.dataset.fallback = '1'; t.src = initialsAvatarDataUrl(lastScanResult.employee.firstName); } }}
                     alt={lastScanResult.employee.firstName}
                     className="w-24 h-24 sm:w-28 sm:h-28 rounded-2xl object-cover border-2 border-emerald-400 shadow-xl"
                   />
@@ -1060,7 +1367,8 @@ export const QRScannerView: React.FC<QRScannerViewProps> = ({
                     >
                       <div className="flex items-center gap-2.5 min-w-0">
                         <img
-                          src={emp.avatarUrl}
+                          src={normalizeAvatarUrl(emp.avatarUrl)}
+                          onError={(e) => { const t = e.currentTarget as HTMLImageElement; if (!t.dataset.fallback) { t.dataset.fallback = '1'; t.src = initialsAvatarDataUrl(emp.firstName); } }}
                           alt={emp.firstName}
                           className="w-9 h-9 rounded-lg object-cover border border-slate-700 shrink-0"
                         />
@@ -1075,7 +1383,7 @@ export const QRScannerView: React.FC<QRScannerViewProps> = ({
                       </div>
 
                       <button
-                        onClick={() => handleProcessScan(emp.qrPayload)}
+                        onClick={() => handleProcessScan(serializeDailyQrPayload(buildDailyQrPayload(emp)))}
                         title={`Marcar: ${nextMeta.label}`}
                         className="shrink-0 px-2.5 py-1.5 rounded-lg text-[11px] font-bold transition-all flex items-center gap-1 shadow-sm active:scale-95 text-white"
                         style={{ backgroundColor: nextMeta.color }}
@@ -1117,7 +1425,8 @@ export const QRScannerView: React.FC<QRScannerViewProps> = ({
                     >
                       <div className="flex items-center gap-2.5">
                         <img
-                          src={rec.avatarUrl}
+                          src={normalizeAvatarUrl(rec.avatarUrl)}
+                          onError={(e) => { const t = e.currentTarget as HTMLImageElement; if (!t.dataset.fallback) { t.dataset.fallback = '1'; t.src = initialsAvatarDataUrl(rec.employeeName); } }}
                           alt={rec.employeeName}
                           className="w-7 h-7 rounded-full object-cover border border-slate-700"
                         />

@@ -8,20 +8,18 @@ import {
   Database, 
   Download, 
   Upload, 
-  RotateCcw, 
   Check, 
   ShieldCheck,
-  Trash2,
-  AlertTriangle
+  Trash2
 } from 'lucide-react';
 import { AttendanceRecord, Employee, SystemConfig } from '../../types/attendance';
+import { DailyQrModule } from './DailyQrModule';
 
 interface SettingsViewProps {
   config: SystemConfig;
   onUpdateConfig: (config: SystemConfig) => void;
   employees: Employee[];
   records: AttendanceRecord[];
-  onResetData: () => void;
   onClearRecordsOnly: () => void;
   onRestoreBackup: (employees: Employee[], records: AttendanceRecord[], config: SystemConfig) => void;
 }
@@ -31,7 +29,6 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   onUpdateConfig,
   employees,
   records,
-  onResetData,
   onClearRecordsOnly,
   onRestoreBackup,
 }) => {
@@ -308,18 +305,6 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         <div className="pt-4 border-t border-slate-800/80 flex flex-wrap items-center justify-between gap-3">
           <button
             onClick={() => {
-              if (window.confirm('¿Deseas restablecer los datos de demostración con 8 empleados y registros de prueba?')) {
-                onResetData();
-              }
-            }}
-            className="px-3.5 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-all"
-          >
-            <RotateCcw className="w-3.5 h-3.5 text-amber-400" />
-            Restablecer Datos de Demostración
-          </button>
-
-          <button
-            onClick={() => {
               if (window.confirm('¿Seguro que deseas vaciar todos los registros de marcación? Los empleados se conservarán.')) {
                 onClearRecordsOnly();
               }
@@ -331,6 +316,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           </button>
         </div>
       </div>
+
+      {/* Módulo de generación de QR diarios por colaborador */}
+      <DailyQrModule employees={employees} />
     </div>
   );
 };

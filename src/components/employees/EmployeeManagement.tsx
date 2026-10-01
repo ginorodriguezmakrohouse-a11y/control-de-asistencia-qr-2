@@ -17,6 +17,7 @@ import {
 } from 'lucide-react';
 import { Employee, SystemConfig } from '../../types/attendance';
 import { EmployeeBadgeModal } from './EmployeeBadgeModal';
+import { normalizeAvatarUrl, initialsAvatarDataUrl, isNonDirectImageUrl } from '../../utils/avatar';
 
 interface EmployeeManagementProps {
   employees: Employee[];
@@ -303,7 +304,8 @@ export const EmployeeManagement: React.FC<EmployeeManagementProps> = ({
                     <td className="py-3.5 px-4">
                       <div className="flex items-center gap-3">
                         <img
-                          src={emp.avatarUrl}
+                          src={normalizeAvatarUrl(emp.avatarUrl)}
+                          onError={(e) => { const t = e.currentTarget as HTMLImageElement; if (!t.dataset.fallback) { t.dataset.fallback = '1'; t.src = initialsAvatarDataUrl(emp.firstName); } }}
                           alt={emp.firstName}
                           className="w-10 h-10 rounded-xl object-cover border border-slate-700 shrink-0"
                         />
@@ -556,8 +558,11 @@ export const EmployeeManagement: React.FC<EmployeeManagementProps> = ({
                   type="url"
                   value={formData.avatarUrl}
                   onChange={(e) => setFormData({ ...formData, avatarUrl: e.target.value })}
-                  placeholder="https://..."
-                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-1.5 text-xs text-slate-300 font-mono"
+                  placeholder="https://... (URL directa de imagen)"
+                  className={
+                    'w-full bg-slate-950 border rounded-xl px-3 py-1.5 text-xs text-slate-300 font-mono ' +
+                    (isNonDirectImageUrl(formData.avatarUrl) ? 'border-amber-500/70' : 'border-slate-800')
+                  }
                 />
               </div>
 

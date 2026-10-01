@@ -79,12 +79,30 @@ export default function App() {
 
   // Handlers for state & persistence
   const handleAddRecord = async (record: AttendanceRecord) => {
-    setRecords(prev => [record, ...prev]);
-    StorageService.addRecord(record);
+    // Registro en Supabase PRIMERO: si falla, se propaga el error para que el
+    // escáner NO cierre la ventana del lector y permita reintentar.
     if (isSupabaseConfigured) {
-      try { await SupabaseService.addRecord(record); }
-      catch (err) { console.error('Error guardando registro:', err); }
+      await SupabaseService.addRecord(record);
     }
+    // Solo persistir localmente y pintar en pantalla cuando el dato quedó
+    // registrado correctamente. Se deduplica por (empleado+tipo+fecha) para
+    // que un mismo movimiento no aparezca varias veces en la lista en
+    // memoria aunque el evento llegue duplicado.
+    StorageService.addRecord(record);
+    setRecords(prev => {
+      const dupIdx = prev.findIndex(
+        r =>
+          r.employeeId === record.employeeId &&
+          r.type === record.type &&
+          r.date === record.date
+      );
+      if (dupIdx !== -1) {
+        const next = [...prev];
+        next[dupIdx] = record; // reemplaza en vez de duplicar
+        return next;
+      }
+      return [record, ...prev];
+    });
   };
 
   const handleAddEmployee = async (emp: Employee) => {
@@ -130,29 +148,6 @@ export default function App() {
     if (isSupabaseConfigured) {
       SupabaseService.saveConfig(newConfig).catch(err => console.error('Error guardando config:', err));
     }
-  };
-
-  const handleResetData = async () => {
-    StorageService.resetToDefault();
-    if (isSupabaseConfigured) {
-      try {
-        await SupabaseService.clearRecords();
-        await SupabaseService.saveEmployees(StorageService.getEmployees());
-        await SupabaseService.saveConfig(StorageService.getConfig());
-        const resetEmps = await SupabaseService.getEmployees();
-        const resetRecs = await SupabaseService.getRecords();
-        const resetCfg = await SupabaseService.getConfig();
-        setEmployees(resetEmps || []);
-        setRecords(resetRecs || []);
-        setConfig(resetCfg || DEFAULT_CONFIG);
-        return;
-      } catch (err) {
-        console.error('Error al reiniciar datos en Supabase:', err);
-      }
-    }
-    setEmployees(StorageService.getEmployees());
-    setRecords([]);
-    setConfig(StorageService.getConfig());
   };
 
   const handleClearRecordsOnly = () => {
@@ -253,7 +248,6 @@ export default function App() {
             onUpdateConfig={handleUpdateConfig}
             employees={employees}
             records={records}
-            onResetData={handleResetData}
             onClearRecordsOnly={handleClearRecordsOnly}
             onRestoreBackup={handleRestoreBackup}
           />

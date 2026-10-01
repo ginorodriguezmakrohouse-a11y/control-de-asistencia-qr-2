@@ -60,9 +60,17 @@ export const SupabaseService = {
   },
 
   async addRecord(rec: AttendanceRecord): Promise<void> {
+    // onConflict:'employee_id,type,date' respeta el índice único
+    // uq_records_employee_type_date: si ya existe un movimiento del mismo
+    // tipo para ese empleado ese día, Supabase ignora la fila en vez de
+    // duplicarla (evita el registro múltiple incluso con peticiones
+    // concurrentes desde varias pestañas/terminales).
     const { error } = await supabase
       .from('attendance_records')
-      .insert(recordToDb(rec));
+      .upsert(recordToDb(rec), {
+        onConflict: 'employee_id,type,date',
+        ignoreDuplicates: true,
+      });
     if (error) throw error;
   },
 
@@ -106,5 +114,34 @@ export const SupabaseService = {
       .from('system_config')
       .upsert(configToDb(cfg), { onConflict: 'id' });
     if (error) throw error;
+  },
+
+  // ---- QR diario por colaborador ----
+  // Guarda/actualiza el payload del QR de un empleado para una fecha.
+  // onConflict:'employee_id,qr_date' respeta el índice único
+  // uq_daily_qr_employee_date: no puede haber dos códigos distintos
+  // para el mismo empleado el mismo día.
+  async saveDailyQr(employeeId: string, qrDate: string, payload: string): Promise<void> {
+    const { error } = await supabase
+      .from('daily_qr_codes')
+      .upsert(
+        { employee_id: employeeId, qr_date: qrDate, payload },
+        { onConflict: 'employee_id,qr_date' }
+      );
+    if (error) throw error;
+  },
+
+  async getDailyQrCodes(qrDate?: string): Promise<
+    { employee_id: string; qr_date: string; payload: string; created_at: string }[]
+  > {
+    let query = supabase
+      .from('daily_qr_codes')
+      .select('employee_id, qr_date, payload, created_at')
+      .order('qr_date', { ascending: false })
+      .limit(5000);
+    if (qrDate) query = query.eq('qr_date', qrDate);
+    const { data, error } = await query;
+    if (error) throw error;
+    return data || [];
   },
 };

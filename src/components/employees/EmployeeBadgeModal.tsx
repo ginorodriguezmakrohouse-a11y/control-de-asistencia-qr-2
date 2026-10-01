@@ -11,6 +11,9 @@ import {
   ChevronRight
 } from 'lucide-react';
 import { Employee, SystemConfig } from '../../types/attendance';
+import { buildDailyQrPayload, serializeDailyQrPayload } from '../../lib/dailyQr';
+import { getTodayDateStr } from '../../utils/timeCalculations';
+import { normalizeAvatarUrl, initialsAvatarDataUrl } from '../../utils/avatar';
 
 interface EmployeeBadgeModalProps {
   employee: Employee | null;
@@ -32,7 +35,10 @@ export const EmployeeBadgeModal: React.FC<EmployeeBadgeModalProps> = ({
 
   useEffect(() => {
     if (!employee) return;
-    QRCode.toDataURL(employee.qrPayload, {
+    // Credencial con QR DIARIO: contiene los datos del colaborador y la fecha
+    // de impresión. El escáner solo lo acepta el mismo día (luego caduca).
+    const payloadText = serializeDailyQrPayload(buildDailyQrPayload(employee, getTodayDateStr()));
+    QRCode.toDataURL(payloadText, {
       width: 320,
       margin: 1,
       color: {
@@ -141,7 +147,8 @@ export const EmployeeBadgeModal: React.FC<EmployeeBadgeModalProps> = ({
             {/* Employee Photo */}
             <div className="relative inline-block mx-auto mb-3">
               <img
-                src={employee.avatarUrl}
+                src={normalizeAvatarUrl(employee.avatarUrl)}
+                          onError={(e) => { const t = e.currentTarget as HTMLImageElement; if (!t.dataset.fallback) { t.dataset.fallback = '1'; t.src = initialsAvatarDataUrl(employee.firstName); } }}
                 alt={employee.firstName}
                 className="w-24 h-24 rounded-2xl object-cover border-2 border-emerald-400 shadow-lg mx-auto"
               />

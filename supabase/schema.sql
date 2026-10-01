@@ -56,6 +56,17 @@ CREATE INDEX IF NOT EXISTS idx_records_employee ON attendance_records(employee_i
 CREATE INDEX IF NOT EXISTS idx_records_timestamp ON attendance_records(timestamp);
 CREATE INDEX IF NOT EXISTS idx_records_date ON attendance_records(date);
 
+-- ============================================================
+-- ANTI-DUPLICADOS (capa de base de datos)
+-- Aunque el escáner ya bloquea lecturas repetidas en memoria,
+-- esta restricción garantiza que NIUNCA se registren dos
+-- movimientos del mismo tipo para el mismo empleado el mismo
+-- día, aunque lleguen peticiones duplicadas por rebotes,
+-- reintentos o varias pestañas/terminales.
+-- ============================================================
+CREATE UNIQUE INDEX IF NOT EXISTS uq_records_employee_type_date
+  ON attendance_records (employee_id, type, date);
+
 CREATE OR REPLACE FUNCTION update_updated_at_column()
 RETURNS TRIGGER AS $$ BEGIN NEW.updated_at = NOW(); RETURN NEW; END; $$ language 'plpgsql';
 
@@ -100,3 +111,29 @@ DROP POLICY IF EXISTS "public_write_config" ON system_config;
 CREATE POLICY "public_write_config" ON system_config FOR INSERT WITH CHECK (true);
 DROP POLICY IF EXISTS "public_update_config" ON system_config;
 CREATE POLICY "public_update_config" ON system_config FOR UPDATE USING (true);
+
+-- ============================================================
+-- Módulo QR Diario: tabla de códigos generados por colaborador/día.
+-- Cada fila guarda el payload JSON (datos del colaborador + fecha).
+-- El escáner valida la fecha en cliente; esta tabla deja registro
+-- y un índice único evita generar dos QR distintos el mismo día.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS daily_qr_codes (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  employee_id TEXT NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+  qr_date DATE NOT NULL,
+  payload TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_daily_qr_employee_date
+  ON daily_qr_codes (employee_id, qr_date);
+
+ALTER TABLE daily_qr_codes ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "public_read_daily_qr" ON daily_qr_codes;
+CREATE POLICY "public_read_daily_qr" ON daily_qr_codes FOR SELECT USING (true);
+DROP POLICY IF EXISTS "public_write_daily_qr" ON daily_qr_codes;
+CREATE POLICY "public_write_daily_qr" ON daily_qr_codes FOR INSERT WITH CHECK (true);
+DROP POLICY IF EXISTS "public_update_daily_qr" ON daily_qr_codes;
+CREATE POLICY "public_update_daily_qr" ON daily_qr_codes FOR UPDATE USING (true);
