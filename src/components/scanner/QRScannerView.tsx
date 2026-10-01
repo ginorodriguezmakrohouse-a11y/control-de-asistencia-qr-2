@@ -89,6 +89,19 @@ export const QRScannerView: React.FC<QRScannerViewProps> = ({
   // que dejaba el lector en un estado inconsistente y la cámara "fallando").
   const cameraOperationLockRef = useRef<boolean>(false);
 
+  // === BLOQUEO ASÍNCRONO ANTI-DUPLICADOS (registro múltiple) ===
+  // scanCooldown e isRegistering son ESTADOS de React: entre que html5-qrcode
+  // dispara onSuccess varias veces en el mismo tick y React re-renderiza, los
+  // closures antiguos aún ven los valores viejos y cada callback registraba su
+  // propio registro. Los refs se actualizan de forma síncrona, antes del await,
+  // garantizando que SOLO el primer escaneo de un código avanza al registro.
+  const processingRef = useRef<boolean>(false);
+  const lastProcessedPayloadRef = useRef<string>('');
+  const lastProcessedAtRef = useRef<number>(0);
+  // Claves "empleado+tipo" ya registradas durante esta sesión de lectura.
+  // Se limpian al cerrar/reabrir el lector o al pulsar "Escanear otro".
+  const sessionKeysRef = useRef<Set<string>>(new Set());
+
   // Manual or barcode input
   const [manualCode, setManualCode] = useState<string>('');
   const [selectedEventType, setSelectedEventType] = useState<AttendanceEventType | 'auto'>('auto');
@@ -215,9 +228,28 @@ export const QRScannerView: React.FC<QRScannerViewProps> = ({
     const cleanPayload = payload.trim();
     if (!cleanPayload) return;
 
-    // Pausar el decodificador inmediatamente: evita que la misma persona
-    // frente a la cámara genere escaneos duplicados mientras se registra.
-    const pauseDecoding = async () => {
+    // === GUARDAS SINCRÓNICAS ANTI-REGISTRO-MÚLTIPLE ===
+    // (1) Bloqueo de proceso: solo un escaneo puede estar en curso. Como el
+    // flag es un REF, se activa inmediatamente — los callbacks que html5-qrcode
+    // lance en el mismo tick (fps 15) quedan descartados aunque React aún no
+    // haya re-renderizado.
+    if (processingRef.current) return;
+    processingRef.current = true;
+
+    // (2) Mismo código repetido dentro de 3s => rebote del lector o pistola
+    // USB que envía Enter doble. Se descarta sin registrar.
+    const nowMs = Date.now();
+    if (
+      cleanPayload.toLowerCase() === lastProcessedPayloadRef.current &&
+      nowMs - lastProcessedAtRef.current < 3000
+    ) {
+      processingRef.current = false;
+      return;
+    }
+
+    try {
+      // Pausar el decodificador inmediatamente: evita que la misma persona
+      // frente a la cámara genere escaneos duplicados mientras se registra.
       try {
         const inst = html5QrCodeRef.current;
         if (inst && inst.getState() === Html5QrcodeScannerState.SCANNING) {
@@ -226,155 +258,178 @@ export const QRScannerView: React.FC<QRScannerViewProps> = ({
       } catch {
         // Si pausa falla, el cierre/registro posterior lo controla igual.
       }
-    };
-    await pauseDecoding();
 
-    // Search employee by qrPayload, id, or documentId (solo coincidencia exacta:
-    // el "includes" laxo podía hacer match con el empleado equivocado).
-    const lp = cleanPayload.toLowerCase();
-    const codeMatch = lp.match(/(?:code|qr|id)=([^&\s]+)/);
-    const matchedEmployee = employees.find(
-      e => 
-        e.qrPayload.toLowerCase() === lp ||
-        e.id.toLowerCase() === lp ||
-        e.documentId.toLowerCase() === lp ||
-        // tolerar QR que envuelve el payload, p.ej. "https://...?code=QR-EMP-1001"
-        (!!codeMatch && (
-          codeMatch[1] === e.qrPayload.toLowerCase() ||
-          codeMatch[1] === e.id.toLowerCase() ||
-          codeMatch[1] === e.documentId.toLowerCase()
-        ))
-    );
-
-    if (!matchedEmployee) {
-      if (config.soundEnabled) sounds.playError();
-      setErrorMessage(`Código QR "${cleanPayload}" no reconocido en el sistema.`);
-      setTimeout(() => setErrorMessage(null), 4000);
-      // No se registró nada: reanudar la lectura para permitir otro escaneo.
-      await resumeDecodingIfPaused();
-      return;
-    }
-
-    if (!matchedEmployee.active) {
-      if (config.soundEnabled) sounds.playError();
-      setErrorMessage(`El empleado ${matchedEmployee.firstName} ${matchedEmployee.lastName} se encuentra DESACTIVADO.`);
-      setTimeout(() => setErrorMessage(null), 4000);
-      await resumeDecodingIfPaused();
-      return;
-    }
-
-    // Determine event type
-    const empTodayRecords = todayRecords.filter(r => r.employeeId === matchedEmployee.id);
-    let eventTypeToRegister: AttendanceEventType;
-
-    if (selectedEventType === 'auto') {
-      const nextDecision = determineNextAttendanceEvent(matchedEmployee, empTodayRecords);
-      eventTypeToRegister = nextDecision.suggestedType;
-    } else {
-      eventTypeToRegister = selectedEventType;
-    }
-
-    const currentTime = getCurrentTimeStr();
-    const nowIso = new Date().toISOString();
-
-    // Check if late for morning entry
-    let isLate = false;
-    let delayMinutes = 0;
-    if (eventTypeToRegister === 'morning_in') {
-      const lateCheck = checkIsLate(
-        currentTime,
-        matchedEmployee.schedule.entryTime,
-        matchedEmployee.schedule.toleranceMinutes
+      // Search employee by qrPayload, id, or documentId (solo coincidencia exacta:
+      // el "includes" laxo podía hacer match con el empleado equivocado).
+      const lp = cleanPayload.toLowerCase();
+      const codeMatch = lp.match(/(?:code|qr|id)=([^&\s]+)/);
+      const matchedEmployee = employees.find(
+        e => 
+          e.qrPayload.toLowerCase() === lp ||
+          e.id.toLowerCase() === lp ||
+          e.documentId.toLowerCase() === lp ||
+          // tolerar QR que envuelve el payload, p.ej. "https://...?code=QR-EMP-1001"
+          (!!codeMatch && (
+            codeMatch[1] === e.qrPayload.toLowerCase() ||
+            codeMatch[1] === e.id.toLowerCase() ||
+            codeMatch[1] === e.documentId.toLowerCase()
+          ))
       );
-      isLate = lateCheck.isLate;
-      delayMinutes = lateCheck.delayMinutes;
-    }
 
-    const newRecord: AttendanceRecord = {
-      // randomUUID evita colisiones de PRIMARY KEY al marcar dos terminales
-      // el mismo milisegundo (Date.now() era predecible/duplicable).
-      id: (typeof crypto !== 'undefined' && 'randomUUID' in crypto)
-        ? `REC-${crypto.randomUUID()}`
-        : `REC-${Date.now()}-${Math.random().toString(36).slice(2, 10)}-${matchedEmployee.id}`,
-      employeeId: matchedEmployee.id,
-      employeeName: `${matchedEmployee.firstName} ${matchedEmployee.lastName}`,
-      employeeDocument: matchedEmployee.documentId,
-      department: matchedEmployee.department,
-      avatarUrl: matchedEmployee.avatarUrl,
-      type: eventTypeToRegister,
-      timestamp: nowIso,
-      date: todayDateStr,
-      time: currentTime,
-      isLate,
-      delayMinutes,
-      terminalName: 'Terminal Principal RR.HH',
-    };
+      if (!matchedEmployee) {
+        if (config.soundEnabled) sounds.playError();
+        setErrorMessage(`Código QR "${cleanPayload}" no reconocido en el sistema.`);
+        setTimeout(() => setErrorMessage(null), 4000);
+        // No se registró nada: reanudar la lectura para permitir otro escaneo.
+        await resumeDecodingIfPaused();
+        return;
+      }
 
-    // === PASO 1: Registrar la entrada/salida en Supabase (vía onAddRecord,
-    // que persiste en attendance_records y hace fallback local). El escáner
-    // ESPERA a que el registro se confirme antes de cerrar el lector. ===
-    setIsRegistering(true);
-    try {
-      await Promise.resolve(onAddRecord(newRecord));
-    } catch (err) {
-      console.error('Error al registrar la marcación:', err);
-      if (config.soundEnabled) sounds.playError();
-      setErrorMessage('No se pudo guardar la marcación (error de conexión con Supabase). Inténtalo de nuevo.');
-      setTimeout(() => setErrorMessage(null), 5000);
-      setIsRegistering(false);
-      // La cámara sigue abierta: reanudar la lectura para poder reintentar.
-      await resumeDecodingIfPaused();
-      return;
-    }
-    setIsRegistering(false);
+      if (!matchedEmployee.active) {
+        if (config.soundEnabled) sounds.playError();
+        setErrorMessage(`El empleado ${matchedEmployee.firstName} ${matchedEmployee.lastName} se encuentra DESACTIVADO.`);
+        setTimeout(() => setErrorMessage(null), 4000);
+        await resumeDecodingIfPaused();
+        return;
+      }
 
-    // Audio & Visual feedback
-    if (config.soundEnabled) {
-      if (isLate) {
-        sounds.playWarning();
+      // Determine event type
+      const empTodayRecords = todayRecords.filter(r => r.employeeId === matchedEmployee.id);
+      let eventTypeToRegister: AttendanceEventType;
+
+      if (selectedEventType === 'auto') {
+        const nextDecision = determineNextAttendanceEvent(matchedEmployee, empTodayRecords);
+        eventTypeToRegister = nextDecision.suggestedType;
       } else {
-        sounds.playSuccess();
+        eventTypeToRegister = selectedEventType;
       }
-    }
 
-    // Small celebratory confetti for on-time morning entry
-    if (eventTypeToRegister === 'morning_in' && !isLate) {
+      // (3) Deduplicación por sesión: si este empleado+tipo ya quedó registrado
+      // en esta sesión de lectura, NO volver a insertar (evita filas duplicadas
+      // en attendance_records cuando el lector dispara el mismo QR otra vez).
+      const sessionKey = `${matchedEmployee.id}:${eventTypeToRegister}`;
+      if (sessionKeysRef.current.has(sessionKey)) {
+        if (config.soundEnabled) sounds.playError();
+        setErrorMessage('Esta marcación ya fue registrada en esta sesión. Escanea otro código o pulsa "Escanear otro".');
+        setTimeout(() => setErrorMessage(null), 4000);
+        await resumeDecodingIfPaused();
+        return;
+      }
+
+      const currentTime = getCurrentTimeStr();
+      const nowIso = new Date().toISOString();
+
+      // Check if late for morning entry
+      let isLate = false;
+      let delayMinutes = 0;
+      if (eventTypeToRegister === 'morning_in') {
+        const lateCheck = checkIsLate(
+          currentTime,
+          matchedEmployee.schedule.entryTime,
+          matchedEmployee.schedule.toleranceMinutes
+        );
+        isLate = lateCheck.isLate;
+        delayMinutes = lateCheck.delayMinutes;
+      }
+
+      const newRecord: AttendanceRecord = {
+        // randomUUID evita colisiones de PRIMARY KEY al marcar dos terminales
+        // el mismo milisegundo (Date.now() era predecible/duplicable).
+        id: (typeof crypto !== 'undefined' && 'randomUUID' in crypto)
+          ? `REC-${crypto.randomUUID()}`
+          : `REC-${Date.now()}-${Math.random().toString(36).slice(2, 10)}-${matchedEmployee.id}`,
+        employeeId: matchedEmployee.id,
+        employeeName: `${matchedEmployee.firstName} ${matchedEmployee.lastName}`,
+        employeeDocument: matchedEmployee.documentId,
+        department: matchedEmployee.department,
+        avatarUrl: matchedEmployee.avatarUrl,
+        type: eventTypeToRegister,
+        timestamp: nowIso,
+        date: todayDateStr,
+        time: currentTime,
+        isLate,
+        delayMinutes,
+        terminalName: 'Terminal Principal RR.HH',
+      };
+
+      // Marcar el payload como procesado ANTES del await: cualquier callback
+      // pendiente del mismo código queda descartado por las guardas (1)-(3).
+      lastProcessedPayloadRef.current = lp;
+      lastProcessedAtRef.current = Date.now();
+      sessionKeysRef.current.add(sessionKey);
+
+      // === PASO 1: Registrar la entrada/salida en Supabase (vía onAddRecord,
+      // que persiste en attendance_records y hace fallback local). El escáner
+      // ESPERA a que el registro se confirme antes de cerrar el lector. ===
+      setIsRegistering(true);
       try {
-        confetti({
-          particleCount: 25,
-          spread: 40,
-          origin: { y: 0.7 },
-        });
-      } catch {
-        // ignore
+        await Promise.resolve(onAddRecord(newRecord));
+      } catch (err) {
+        console.error('Error al registrar la marcación:', err);
+        if (config.soundEnabled) sounds.playError();
+        setErrorMessage('No se pudo guardar la marcación (error de conexión con Supabase). Inténtalo de nuevo.');
+        setTimeout(() => setErrorMessage(null), 5000);
+        setIsRegistering(false);
+        // El registro FALLÓ: quitar la clave de sesión para permitir reintentar
+        // el mismo código, y reanudar la lectura.
+        sessionKeysRef.current.delete(sessionKey);
+        await resumeDecodingIfPaused();
+        return;
       }
+      setIsRegistering(false);
+
+      // Audio & Visual feedback
+      if (config.soundEnabled) {
+        if (isLate) {
+          sounds.playWarning();
+        } else {
+          sounds.playSuccess();
+        }
+      }
+
+      // Small celebratory confetti for on-time morning entry
+      if (eventTypeToRegister === 'morning_in' && !isLate) {
+        try {
+          confetti({
+            particleCount: 25,
+            spread: 40,
+            origin: { y: 0.7 },
+          });
+        } catch {
+          // ignore
+        }
+      }
+
+      setLastScanResult({
+        record: newRecord,
+        employee: matchedEmployee,
+        eventMeta: EVENT_LABELS[eventTypeToRegister],
+        message: isLate 
+          ? `Tardanza registrada (+${delayMinutes} min sobre tolerancia)`
+          : '¡Marcación registrada correctamente!',
+        isLate,
+        delayMinutes,
+      });
+
+      setErrorMessage(null);
+      setManualCode('');
+
+      // === PASO 2: Una vez registrado el dato, CERRAR la ventana del lector
+      // de código QR: se detiene y libera la cámara y se oculta el visor,
+      // mostrando la tarjeta de confirmación con botón "Escanear otro". ===
+      await stopCamera();
+      closeReaderWindow();
+
+      // Prevent immediate double scan (1.8s cooldown)
+      setScanCooldown(true);
+      setTimeout(() => {
+        setScanCooldown(false);
+      }, 1800);
+    } finally {
+      // Liberar el bloqueo síncrono SIEMPRE, incluso si alguna fase lanza una
+      // excepción inesperada (antes un error dejaba el lector inutilizable).
+      processingRef.current = false;
     }
-
-    setLastScanResult({
-      record: newRecord,
-      employee: matchedEmployee,
-      eventMeta: EVENT_LABELS[eventTypeToRegister],
-      message: isLate 
-        ? `Tardanza registrada (+${delayMinutes} min sobre tolerancia)`
-        : '¡Marcación registrada correctamente!',
-      isLate,
-      delayMinutes,
-    });
-
-    setErrorMessage(null);
-    setManualCode('');
-
-    // === PASO 2: Una vez registrado el dato, CERRAR la ventana del lector
-    // de código QR: se detiene y libera la cámara y se oculta el visor,
-    // mostrando la tarjeta de confirmación con botón "Escanear otro". ===
-    await stopCamera();
-    closeReaderWindow();
-
-    // Prevent immediate double scan (1.8s cooldown)
-    setScanCooldown(true);
-    setTimeout(() => {
-      setScanCooldown(false);
-    }, 1800);
   }, [
     scanCooldown,
     isRegistering,
@@ -543,6 +598,9 @@ export const QRScannerView: React.FC<QRScannerViewProps> = ({
       // La cámara es la "ventana del lector": al encenderse, el visor vuelve
       // a mostrarse (p. ej. tras cerrarse automáticamente al registrar).
       setShowReader(true);
+      // Nueva sesión de lectura: se limpia la deduplicación previa para que
+      // los empleados puedan volver a marcar (entrada/salida) en esta sesión.
+      sessionKeysRef.current.clear();
 
       // Refresh camera labels now that permission is granted
       refreshCameras();
