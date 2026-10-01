@@ -79,12 +79,15 @@ export default function App() {
 
   // Handlers for state & persistence
   const handleAddRecord = async (record: AttendanceRecord) => {
-    setRecords(prev => [record, ...prev]);
-    StorageService.addRecord(record);
+    // Registro en Supabase PRIMERO: si falla, se propaga el error para que el
+    // escáner NO cierre la ventana del lector y permita reintentar.
     if (isSupabaseConfigured) {
-      try { await SupabaseService.addRecord(record); }
-      catch (err) { console.error('Error guardando registro:', err); }
+      await SupabaseService.addRecord(record);
     }
+    // Solo persistir localmente y pintar en pantalla cuando el dato quedó
+    // registrado correctamente.
+    StorageService.addRecord(record);
+    setRecords(prev => [record, ...prev]);
   };
 
   const handleAddEmployee = async (emp: Employee) => {
