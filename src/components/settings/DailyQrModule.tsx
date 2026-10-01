@@ -1,8 +1,10 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { CalendarDays, Download, Printer, RefreshCw, Users } from 'lucide-react';
 import type { Employee } from '../../types/attendance';
 import { getTodayDateStr, formatDateSpanish } from '../../utils/timeCalculations';
 import { generateDailyQrDataUrl, serializeDailyQrPayload, buildDailyQrPayload } from '../../lib/dailyQr';
+import { SupabaseService } from '../../lib/supabaseService';
+import { isSupabaseConfigured } from '../../lib/supabase';
 
 interface DailyQrModuleProps {
   employees: Employee[];
@@ -24,7 +26,11 @@ export const DailyQrModule: React.FC<DailyQrModuleProps> = ({ employees }) => {
   const [selectedDate, setSelectedDate] = useState<string>(getTodayDateStr());
   const [cards, setCards] = useState<CardData[]>([]);
   const [isGenerating, setIsGenerating] = useState(false);
+  const [syncStatus, setSyncStatus] = useState<'idle' | 'syncing' | 'synced' | 'failed'>('idle');
   const [error, setError] = useState<string | null>(null);
+
+  // Bloqueo síncrono: evita dos generaciones concurrentes (doble clic).
+  const generatingLockRef = useRef(false);
 
   const activeEmployees = useMemo(
     () => employees.filter(e => e.active),
@@ -32,10 +38,12 @@ export const DailyQrModule: React.FC<DailyQrModuleProps> = ({ employees }) => {
   );
 
   const generateAll = async () => {
+    if (generatingLockRef.current) return;
     if (activeEmployees.length === 0) {
       setError('No hay colaboradores activos para generar códigos.');
       return;
     }
+    generatingLockRef.current = true;
     setIsGenerating(true);
     setError(null);
     try {
@@ -47,10 +55,28 @@ export const DailyQrModule: React.FC<DailyQrModuleProps> = ({ employees }) => {
         }))
       );
       setCards(results);
+
+      // Dejar registro en Supabase (tabla daily_qr_codes, upsert por
+      // empleado+fecha). Es best-effort: si falla, los QR generados en
+      // cliente siguen siendo utilizables/imprimibles.
+      if (isSupabaseConfigured) {
+        setSyncStatus('syncing');
+        try {
+          await Promise.all(
+            results.map(c =>
+              SupabaseService.saveDailyQr(c.employee.id, selectedDate, c.payloadText)
+            )
+          );
+          setSyncStatus('synced');
+        } catch {
+          setSyncStatus('failed');
+        }
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Error al generar los códigos QR.');
     } finally {
       setIsGenerating(false);
+      generatingLockRef.current = false;
     }
   };
 
@@ -159,9 +185,18 @@ export const DailyQrModule: React.FC<DailyQrModuleProps> = ({ employees }) => {
         )}
       </div>
 
-      <p className="text-xs text-slate-500 flex items-center gap-1.5">
+      <p className="text-xs text-slate-500 flex items-center gap-1.5 flex-wrap">
         <Users className="w-3.5 h-3.5" />
         {activeEmployees.length} colaborador(es) activo(s)
+        {syncStatus === 'syncing' && (
+          <span className="text-cyan-400">• Sincronizando con Supabase…</span>
+        )}
+        {syncStatus === 'synced' && (
+          <span className="text-emerald-400">• Códigos registrados en Supabase ✓</span>
+        )}
+        {syncStatus === 'failed' && (
+          <span className="text-amber-400">• No se pudo registrar en Supabase (los QR siguen siendo válidos; reintentar con «Generar»).</span>
+        )}
         {selectedDate !== getTodayDateStr() && (
           <span className="text-amber-400">• Fecha distinta a hoy: estos QR solo se aceptarán el {selectedDate}.</span>
         )}
