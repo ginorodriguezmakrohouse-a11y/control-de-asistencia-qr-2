@@ -392,7 +392,21 @@ export const StorageService = {
 
   addRecord(record: AttendanceRecord): AttendanceRecord[] {
     const current = this.getRecords();
-    const updated = [record, ...current];
+    // Deduplicación por (empleado+tipo+fecha): si ya existe el mismo
+    // movimiento del día, se reemplaza en vez de insertar un duplicado.
+    const dupIdx = current.findIndex(
+      r =>
+        r.employeeId === record.employeeId &&
+        r.type === record.type &&
+        r.date === record.date
+    );
+    let updated: AttendanceRecord[];
+    if (dupIdx !== -1) {
+      updated = [...current];
+      updated[dupIdx] = record;
+    } else {
+      updated = [record, ...current];
+    }
     this.saveRecords(updated);
     return updated;
   },

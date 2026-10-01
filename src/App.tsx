@@ -85,9 +85,24 @@ export default function App() {
       await SupabaseService.addRecord(record);
     }
     // Solo persistir localmente y pintar en pantalla cuando el dato quedó
-    // registrado correctamente.
+    // registrado correctamente. Se deduplica por (empleado+tipo+fecha) para
+    // que un mismo movimiento no aparezca varias veces en la lista en
+    // memoria aunque el evento llegue duplicado.
     StorageService.addRecord(record);
-    setRecords(prev => [record, ...prev]);
+    setRecords(prev => {
+      const dupIdx = prev.findIndex(
+        r =>
+          r.employeeId === record.employeeId &&
+          r.type === record.type &&
+          r.date === record.date
+      );
+      if (dupIdx !== -1) {
+        const next = [...prev];
+        next[dupIdx] = record; // reemplaza en vez de duplicar
+        return next;
+      }
+      return [record, ...prev];
+    });
   };
 
   const handleAddEmployee = async (emp: Employee) => {

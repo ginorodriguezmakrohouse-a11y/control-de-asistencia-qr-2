@@ -56,6 +56,17 @@ CREATE INDEX IF NOT EXISTS idx_records_employee ON attendance_records(employee_i
 CREATE INDEX IF NOT EXISTS idx_records_timestamp ON attendance_records(timestamp);
 CREATE INDEX IF NOT EXISTS idx_records_date ON attendance_records(date);
 
+-- ============================================================
+-- ANTI-DUPLICADOS (capa de base de datos)
+-- Aunque el escáner ya bloquea lecturas repetidas en memoria,
+-- esta restricción garantiza que NIUNCA se registren dos
+-- movimientos del mismo tipo para el mismo empleado el mismo
+-- día, aunque lleguen peticiones duplicadas por rebotes,
+-- reintentos o varias pestañas/terminales.
+-- ============================================================
+CREATE UNIQUE INDEX IF NOT EXISTS uq_records_employee_type_date
+  ON attendance_records (employee_id, type, date);
+
 CREATE OR REPLACE FUNCTION update_updated_at_column()
 RETURNS TRIGGER AS $$ BEGIN NEW.updated_at = NOW(); RETURN NEW; END; $$ language 'plpgsql';
 

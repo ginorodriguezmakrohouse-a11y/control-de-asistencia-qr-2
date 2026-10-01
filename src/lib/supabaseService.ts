@@ -60,9 +60,17 @@ export const SupabaseService = {
   },
 
   async addRecord(rec: AttendanceRecord): Promise<void> {
+    // onConflict:'employee_id,type,date' respeta el índice único
+    // uq_records_employee_type_date: si ya existe un movimiento del mismo
+    // tipo para ese empleado ese día, Supabase ignora la fila en vez de
+    // duplicarla (evita el registro múltiple incluso con peticiones
+    // concurrentes desde varias pestañas/terminales).
     const { error } = await supabase
       .from('attendance_records')
-      .insert(recordToDb(rec));
+      .upsert(recordToDb(rec), {
+        onConflict: 'employee_id,type,date',
+        ignoreDuplicates: true,
+      });
     if (error) throw error;
   },
 
