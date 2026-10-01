@@ -111,3 +111,29 @@ DROP POLICY IF EXISTS "public_write_config" ON system_config;
 CREATE POLICY "public_write_config" ON system_config FOR INSERT WITH CHECK (true);
 DROP POLICY IF EXISTS "public_update_config" ON system_config;
 CREATE POLICY "public_update_config" ON system_config FOR UPDATE USING (true);
+
+-- ============================================================
+-- Módulo QR Diario: tabla de códigos generados por colaborador/día.
+-- Cada fila guarda el payload JSON (datos del colaborador + fecha).
+-- El escáner valida la fecha en cliente; esta tabla deja registro
+-- y un índice único evita generar dos QR distintos el mismo día.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS daily_qr_codes (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  employee_id TEXT NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+  qr_date DATE NOT NULL,
+  payload TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_daily_qr_employee_date
+  ON daily_qr_codes (employee_id, qr_date);
+
+ALTER TABLE daily_qr_codes ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "public_read_daily_qr" ON daily_qr_codes;
+CREATE POLICY "public_read_daily_qr" ON daily_qr_codes FOR SELECT USING (true);
+DROP POLICY IF EXISTS "public_write_daily_qr" ON daily_qr_codes;
+CREATE POLICY "public_write_daily_qr" ON daily_qr_codes FOR INSERT WITH CHECK (true);
+DROP POLICY IF EXISTS "public_update_daily_qr" ON daily_qr_codes;
+CREATE POLICY "public_update_daily_qr" ON daily_qr_codes FOR UPDATE USING (true);

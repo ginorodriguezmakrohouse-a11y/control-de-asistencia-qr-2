@@ -11,6 +11,8 @@ import {
   ChevronRight
 } from 'lucide-react';
 import { Employee, SystemConfig } from '../../types/attendance';
+import { buildDailyQrPayload, serializeDailyQrPayload } from '../../lib/dailyQr';
+import { getTodayDateStr } from '../../utils/timeCalculations';
 
 interface EmployeeBadgeModalProps {
   employee: Employee | null;
@@ -32,7 +34,10 @@ export const EmployeeBadgeModal: React.FC<EmployeeBadgeModalProps> = ({
 
   useEffect(() => {
     if (!employee) return;
-    QRCode.toDataURL(employee.qrPayload, {
+    // Credencial con QR DIARIO: contiene los datos del colaborador y la fecha
+    // de impresión. El escáner solo lo acepta el mismo día (luego caduca).
+    const payloadText = serializeDailyQrPayload(buildDailyQrPayload(employee, getTodayDateStr()));
+    QRCode.toDataURL(payloadText, {
       width: 320,
       margin: 1,
       color: {

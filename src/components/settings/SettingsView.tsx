@@ -15,6 +15,7 @@ import {
   AlertTriangle
 } from 'lucide-react';
 import { AttendanceRecord, Employee, SystemConfig } from '../../types/attendance';
+import { DailyQrModule } from './DailyQrModule';
 
 interface SettingsViewProps {
   config: SystemConfig;
@@ -331,6 +332,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           </button>
         </div>
       </div>
+
+      {/* Módulo de generación de QR diarios por colaborador */}
+      <DailyQrModule employees={employees} />
     </div>
   );
 };

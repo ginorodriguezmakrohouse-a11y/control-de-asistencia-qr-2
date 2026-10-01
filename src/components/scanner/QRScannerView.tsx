@@ -57,6 +57,7 @@ import {
   getTodayDateStr 
 } from '../../utils/timeCalculations';
 import { sounds } from '../../utils/audio';
+import { parseDailyQrPayload, buildDailyQrPayload, serializeDailyQrPayload } from '../../lib/dailyQr';
 
 interface QRScannerViewProps {
   employees: Employee[];
@@ -263,17 +264,37 @@ export const QRScannerView: React.FC<QRScannerViewProps> = ({
       // el "includes" laxo podía hacer match con el empleado equivocado).
       const lp = cleanPayload.toLowerCase();
       const codeMatch = lp.match(/(?:code|qr|id)=([^&\s]+)/);
-      const matchedEmployee = employees.find(
-        e => 
-          e.qrPayload.toLowerCase() === lp ||
-          e.id.toLowerCase() === lp ||
-          e.documentId.toLowerCase() === lp ||
-          // tolerar QR que envuelve el payload, p.ej. "https://...?code=QR-EMP-1001"
-          (!!codeMatch && (
-            codeMatch[1] === e.qrPayload.toLowerCase() ||
-            codeMatch[1] === e.id.toLowerCase() ||
-            codeMatch[1] === e.documentId.toLowerCase()
-          ))
+
+      // === QR DIARIO (JSON con datos del colaborador + fecha) ===
+      // Formato: {"v":1,"id":"EMP-1001","doc":"...","name":"...","dep":"...","date":"YYYY-MM-DD"}
+      // Si trae una fecha distinta a hoy, se rechaza (el código caduca cada día).
+      const dailyQr = parseDailyQrPayload(cleanPayload);
+      if (dailyQr && dailyQr.date !== getTodayDateStr()) {
+        if (config.soundEnabled) sounds.playError();
+        setErrorMessage(
+          `El código QR de ${dailyQr.name || dailyQr.id} es del día ${dailyQr.date} y ya no es válido. Se requiere el QR diario de hoy.`
+        );
+        setTimeout(() => setErrorMessage(null), 4000);
+        await resumeDecodingIfPaused();
+        return;
+      }
+
+      const identityTokens: string[] = [];
+      if (dailyQr) {
+        if (dailyQr.id) identityTokens.push(dailyQr.id.toLowerCase());
+        if (dailyQr.doc) identityTokens.push(dailyQr.doc.toLowerCase());
+      } else {
+        identityTokens.push(lp);
+        if (codeMatch) identityTokens.push(codeMatch[1]);
+      }
+
+      const matchedEmployee = employees.find(e =>
+        identityTokens.some(
+          token =>
+            e.qrPayload.toLowerCase() === token ||
+            e.id.toLowerCase() === token ||
+            e.documentId.toLowerCase() === token
+        )
       );
 
       if (!matchedEmployee) {
@@ -1349,7 +1370,7 @@ export const QRScannerView: React.FC<QRScannerViewProps> = ({
                       </div>
 
                       <button
-                        onClick={() => handleProcessScan(emp.qrPayload)}
+                        onClick={() => handleProcessScan(serializeDailyQrPayload(buildDailyQrPayload(emp)))}
                         title={`Marcar: ${nextMeta.label}`}
                         className="shrink-0 px-2.5 py-1.5 rounded-lg text-[11px] font-bold transition-all flex items-center gap-1 shadow-sm active:scale-95 text-white"
                         style={{ backgroundColor: nextMeta.color }}
