@@ -58,6 +58,7 @@ import {
 } from '../../utils/timeCalculations';
 import { sounds } from '../../utils/audio';
 import { parseDailyQrPayload, buildDailyQrPayload, serializeDailyQrPayload } from '../../lib/dailyQr';
+import { normalizeAvatarUrl, initialsAvatarDataUrl } from '../../utils/avatar';
 
 interface QRScannerViewProps {
   employees: Employee[];
@@ -1244,7 +1245,8 @@ export const QRScannerView: React.FC<QRScannerViewProps> = ({
                 {/* Employee Photo */}
                 <div className="relative shrink-0">
                   <img
-                    src={lastScanResult.employee.avatarUrl}
+                    src={normalizeAvatarUrl(lastScanResult.employee.avatarUrl)}
+                          onError={(e) => { const t = e.currentTarget as HTMLImageElement; if (!t.dataset.fallback) { t.dataset.fallback = '1'; t.src = initialsAvatarDataUrl(lastScanResult.employee.firstName); } }}
                     alt={lastScanResult.employee.firstName}
                     className="w-24 h-24 sm:w-28 sm:h-28 rounded-2xl object-cover border-2 border-emerald-400 shadow-xl"
                   />
@@ -1355,7 +1357,8 @@ export const QRScannerView: React.FC<QRScannerViewProps> = ({
                     >
                       <div className="flex items-center gap-2.5 min-w-0">
                         <img
-                          src={emp.avatarUrl}
+                          src={normalizeAvatarUrl(emp.avatarUrl)}
+                          onError={(e) => { const t = e.currentTarget as HTMLImageElement; if (!t.dataset.fallback) { t.dataset.fallback = '1'; t.src = initialsAvatarDataUrl(emp.firstName); } }}
                           alt={emp.firstName}
                           className="w-9 h-9 rounded-lg object-cover border border-slate-700 shrink-0"
                         />
@@ -1412,7 +1415,8 @@ export const QRScannerView: React.FC<QRScannerViewProps> = ({
                     >
                       <div className="flex items-center gap-2.5">
                         <img
-                          src={rec.avatarUrl}
+                          src={normalizeAvatarUrl(rec.avatarUrl)}
+                          onError={(e) => { const t = e.currentTarget as HTMLImageElement; if (!t.dataset.fallback) { t.dataset.fallback = '1'; t.src = initialsAvatarDataUrl(rec.employeeName); } }}
                           alt={rec.employeeName}
                           className="w-7 h-7 rounded-full object-cover border border-slate-700"
                         />

@@ -14,6 +14,7 @@ import {
   ChevronRight
 } from 'lucide-react';
 import { AttendanceRecord, Employee } from '../../types/attendance';
+import { normalizeAvatarUrl, initialsAvatarDataUrl } from '../../utils/avatar';
 import { 
   buildDailySummary, 
   formatDateSpanish, 
@@ -304,7 +305,8 @@ export const DailyReport: React.FC<DailyReportProps> = ({ employees, records }) 
                     <td className="py-3 px-4">
                       <div className="flex items-center gap-3">
                         <img
-                          src={s.employee.avatarUrl}
+                          src={normalizeAvatarUrl(s.employee.avatarUrl)}
+                          onError={(e) => { const t = e.currentTarget as HTMLImageElement; if (!t.dataset.fallback) { t.dataset.fallback = '1'; t.src = initialsAvatarDataUrl(s.employee.firstName); } }}
                           alt={s.employee.firstName}
                           className="w-9 h-9 rounded-xl object-cover border border-slate-700 shrink-0"
                         />
