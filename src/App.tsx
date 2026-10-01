@@ -150,29 +150,6 @@ export default function App() {
     }
   };
 
-  const handleResetData = async () => {
-    StorageService.resetToDefault();
-    if (isSupabaseConfigured) {
-      try {
-        await SupabaseService.clearRecords();
-        await SupabaseService.saveEmployees(StorageService.getEmployees());
-        await SupabaseService.saveConfig(StorageService.getConfig());
-        const resetEmps = await SupabaseService.getEmployees();
-        const resetRecs = await SupabaseService.getRecords();
-        const resetCfg = await SupabaseService.getConfig();
-        setEmployees(resetEmps || []);
-        setRecords(resetRecs || []);
-        setConfig(resetCfg || DEFAULT_CONFIG);
-        return;
-      } catch (err) {
-        console.error('Error al reiniciar datos en Supabase:', err);
-      }
-    }
-    setEmployees(StorageService.getEmployees());
-    setRecords([]);
-    setConfig(StorageService.getConfig());
-  };
-
   const handleClearRecordsOnly = () => {
     setRecords([]);
     StorageService.saveRecords([]);
@@ -271,7 +248,6 @@ export default function App() {
             onUpdateConfig={handleUpdateConfig}
             employees={employees}
             records={records}
-            onResetData={handleResetData}
             onClearRecordsOnly={handleClearRecordsOnly}
             onRestoreBackup={handleRestoreBackup}
           />

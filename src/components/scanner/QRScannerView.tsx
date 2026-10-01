@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { 
   Camera, 
   CameraOff, 
@@ -132,8 +132,18 @@ export const QRScannerView: React.FC<QRScannerViewProps> = ({
   // File upload scan ref
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  // Today's records for display
-  const todayDateStr = getTodayDateStr();
+  // Tick de "hora actual": avanza cada minuto para que la fecha de hoy se
+  // recalcule automáticamente al cruzar la medianoche sin recargar el terminal.
+  const [nowTick, setNowTick] = useState<number>(() => Date.now());
+  useEffect(() => {
+    const intervalId = window.setInterval(() => setNowTick(Date.now()), 60_000);
+    return () => window.clearInterval(intervalId);
+  }, []);
+
+  // Fecha de HOY recalculada periódicamente: si el terminal queda abierto
+  // pasada la medianoche, los QR diarios siguen validándose contra el día
+  // correcto y las listas del panel muestran el día actual.
+  const todayDateStr = useMemo(() => getTodayDateStr(), [nowTick]);
   const todayRecords = records.filter(r => r.date === todayDateStr);
 
   // Check browser permissions if supported
@@ -270,7 +280,7 @@ export const QRScannerView: React.FC<QRScannerViewProps> = ({
       // Formato: {"v":1,"id":"EMP-1001","doc":"...","name":"...","dep":"...","date":"YYYY-MM-DD"}
       // Si trae una fecha distinta a hoy, se rechaza (el código caduca cada día).
       const dailyQr = parseDailyQrPayload(cleanPayload);
-      if (dailyQr && dailyQr.date !== getTodayDateStr()) {
+      if (dailyQr && dailyQr.date !== todayDateStr) {
         if (config.soundEnabled) sounds.playError();
         setErrorMessage(
           `El código QR de ${dailyQr.name || dailyQr.id} es del día ${dailyQr.date} y ya no es válido. Se requiere el QR diario de hoy.`
