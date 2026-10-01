@@ -17,10 +17,28 @@ const FALLBACK_COLORS = [
   '#ef4444', '#06b6d4', '#ec4899', '#84cc16',
 ];
 
-/** Convierte enlaces de Terabox en la URL de descarga directa conocida (si aplica). */
+/** Extrae el ID de archivo de un enlace de Google Drive (formats /file/d/ID/view, uc?id=, thumbnail?id=). */
+function extractDriveFileId(url: string): string | null {
+  const byPath = url.match(/drive\.google\.com\/(?:u\/\d+\/)?file\/d\/([A-Za-z0-9_-]+)/i);
+  if (byPath) return byPath[1];
+  const byQuery = url.match(/[?&](?:id|uc?id)=([A-Za-z0-9_-]+)/i);
+  if (byQuery) return byQuery[1];
+  return null;
+}
+
+/** Convierte enlaces de Terabox / Google Drive en la URL de imagen directa correspondiente (si aplica). */
 export function normalizeAvatarUrl(raw?: string | null): string {
   const url = (raw ?? '').trim();
   if (!url) return '';
+
+  // Google Drive: cualquier enlace compartido (/file/d/<id>/view, uc?export=download&id=<id>,
+  // thumbnail?id=<id>...) se normaliza a la variante thumbnail, que sirve la imagen directamente
+  // y soporta hotlinking desde <img> (siempre que el archivo esté compartido como
+  // "Cualquier persona con el enlace").
+  if (/drive\.google\.com/i.test(url)) {
+    const id = extractDriveFileId(url);
+    if (id) return `https://drive.google.com/thumbnail?id=${encodeURIComponent(id)}&sz=w1000`;
+  }
 
   // 1024terabox.com/s/<id>, terabox.app/s/<id>, 1024tera.com, freeterabox, etc.
   const teraboxShare = url.match(
@@ -41,7 +59,9 @@ export function normalizeAvatarUrl(raw?: string | null): string {
 export function isNonDirectImageUrl(url?: string | null): boolean {
   const u = (url ?? '').toLowerCase();
   if (!u) return false;
-  return /(terabox|1024tera|mega\.nz|drive\.google\.com\/file|dropbox\.com\/s\/)/.test(u) && !/^https?:\/\/d\./.test(u);
+  // Google Drive ya no se considera "no directo": normalizeAvatarUrl() lo convierte
+  // a la variante thumbnail, que sí sirve la imagen directamente.
+  return /(terabox|1024tera|mega\.nz|dropbox\.com\/s\/)/.test(u) && !/^https?:\/\/d\./.test(u);
 }
 
 /** Genera un data-URL SVG con las iniciales del colaborador (respaldo local). */
